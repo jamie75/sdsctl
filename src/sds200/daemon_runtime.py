@@ -76,6 +76,7 @@ _HOLD_STATE_KEYS = {
     "channel": ("C",),
 }
 _SCANNER_INDEX_UNAVAILABLE = (1 << 32) - 1
+_INACTIVE_PSI_TIMEOUT_ESCALATION_THRESHOLD = 2
 
 
 class _RadioStateLike(Protocol):
@@ -213,6 +214,9 @@ class DaemonRuntimeSnapshot:
     transition_sequence: int
     last_failure_at: datetime | None
     last_error: str | None
+    last_psi_recovery_error: str | None = None
+    last_psi_recovery_action: str | None = None
+    inactive_psi_timeout_streak: int = 0
 
     @property
     def active(self) -> bool:
@@ -252,6 +256,9 @@ class DaemonRuntimeSnapshot:
                 else None
             ),
             "last_error": self.last_error,
+            "last_psi_recovery_error": self.last_psi_recovery_error,
+            "last_psi_recovery_action": self.last_psi_recovery_action,
+            "inactive_psi_timeout_streak": self.inactive_psi_timeout_streak,
         }
 
 
@@ -405,6 +412,10 @@ class DaemonRuntime:
         self._psi_unsubscribe: Callable[[], None] | None = None
         self._last_psi_at: float | None = None
         self._last_psi_recovery_at: float | None = None
+        self._psi_ever_established = False
+        self._last_psi_recovery_error: str | None = None
+        self._last_psi_recovery_action: str | None = None
+        self._inactive_psi_timeout_streak = 0
 
     @property
     def running(self) -> bool:
@@ -445,9 +456,11 @@ class DaemonRuntime:
             psi_active = self.scanner.psi_active
             last_psi_at = self._last_psi_at
             last_recovery_at = self._last_psi_recovery_at
+            psi_ever_established = self._psi_ever_established
+            timeout_streak = self._inactive_psi_timeout_streak
 
         if not psi_active:
-            if not self.allow_degraded_psi_startup:
+            if not self.allow_degraded_psi_startup and not psi_ever_established:
                 return
             retry_delay = (
                 self.psi_recover_after
@@ -460,6 +473,15 @@ class DaemonRuntime:
             ):
                 return
             if self._control_lock.locked():
+                return
+
+            should_reconnect = (
+                psi_ever_established
+                and self.scanner.supports_bounded_reconnect
+                and timeout_streak >= _INACTIVE_PSI_TIMEOUT_ESCALATION_THRESHOLD
+            )
+            if should_reconnect:
+                self._escalate_inactive_psi_recovery(timeout_streak)
                 return
 
             logger.warning(
@@ -477,15 +499,35 @@ class DaemonRuntime:
                 completed_at = self._clock()
                 with self._state_lock:
                     self._last_psi_recovery_at = completed_at
+                    self._last_psi_recovery_error = _redacted_error_type(error)
+                    self._last_psi_recovery_action = "psi-start"
+                    if isinstance(error, CommandTimeoutError):
+                        self._inactive_psi_timeout_streak += 1
+                    else:
+                        self._inactive_psi_timeout_streak = 0
+                    timeout_streak = self._inactive_psi_timeout_streak
                 logger.warning(
-                    "daemon PSI recovery failed scanner=%s error=%s",
+                    "daemon PSI recovery failed scanner=%s error=%s "
+                    "timeout_streak=%d",
                     self.scanner.endpoint,
                     error.__class__.__name__,
+                    timeout_streak,
                 )
+                if (
+                    isinstance(error, CommandTimeoutError)
+                    and timeout_streak
+                    >= _INACTIVE_PSI_TIMEOUT_ESCALATION_THRESHOLD
+                    and psi_ever_established
+                    and self.scanner.supports_bounded_reconnect
+                ):
+                    self._escalate_inactive_psi_recovery(timeout_streak)
             else:
                 completed_at = self._clock()
                 with self._state_lock:
                     self._last_psi_recovery_at = completed_at
+                    self._last_psi_recovery_error = None
+                    self._last_psi_recovery_action = "psi-start"
+                    self._inactive_psi_timeout_streak = 0
                 logger.info(
                     "daemon PSI recovery completed scanner=%s",
                     self.scanner.endpoint,
@@ -537,6 +579,7 @@ class DaemonRuntime:
             completed_at = self._clock()
             with self._state_lock:
                 self._last_psi_recovery_at = completed_at
+                self._last_psi_recovery_error = _redacted_error_type(error)
             logger.warning(
                 "daemon PSI recovery failed scanner=%s error=%s",
                 self.scanner.endpoint,
@@ -546,6 +589,7 @@ class DaemonRuntime:
             completed_at = self._clock()
             with self._state_lock:
                 self._last_psi_recovery_at = completed_at
+                self._last_psi_recovery_error = None
             logger.info(
                 "daemon PSI recovery completed scanner=%s",
                 self.scanner.endpoint,
@@ -648,6 +692,8 @@ class DaemonRuntime:
         del info
         with self._state_lock:
             self._last_psi_at = self._clock()
+            self._inactive_psi_timeout_streak = 0
+            self._last_psi_recovery_error = None
 
     def hold_state(
         self,
@@ -864,6 +910,44 @@ class DaemonRuntime:
                 self.psi_interval_ms,
                 timeout=self.psi_timeout,
             )
+            with self._state_lock:
+                self._psi_ever_established = True
+
+    def _escalate_inactive_psi_recovery(self, timeout_streak: int) -> None:
+        logger.warning(
+            "daemon PSI recovery escalating scanner=%s "
+            "attempting_recovery=control-reconnect timeout_streak=%d",
+            self.scanner.endpoint,
+            timeout_streak,
+        )
+        try:
+            self.reconnect(timeout=2.0)
+        except DaemonControlBusyError:
+            return
+        except Exception as error:
+            completed_at = self._clock()
+            with self._state_lock:
+                self._last_psi_recovery_at = completed_at
+                self._last_psi_recovery_error = _redacted_error_type(error)
+                self._last_psi_recovery_action = "control-reconnect"
+            logger.warning(
+                "daemon control reconnect escalation failed "
+                "scanner=%s error=%s",
+                self.scanner.endpoint,
+                error.__class__.__name__,
+            )
+        else:
+            completed_at = self._clock()
+            with self._state_lock:
+                self._last_psi_recovery_at = completed_at
+                self._last_psi_recovery_error = None
+                self._last_psi_recovery_action = "control-reconnect"
+                self._inactive_psi_timeout_streak = 0
+            logger.info(
+                "daemon control reconnect escalation completed "
+                "scanner=%s",
+                self.scanner.endpoint,
+            )
 
     def _refresh_psi(self) -> None:
         """Restart only the active PSI push without reopening scanner control."""
@@ -883,6 +967,8 @@ class DaemonRuntime:
                 self.psi_interval_ms,
                 timeout=self.psi_timeout,
             )
+            with self._state_lock:
+                self._psi_ever_established = True
 
     def reconnect(
         self,
@@ -952,6 +1038,7 @@ class DaemonRuntime:
                 else:
                     with self._state_lock:
                         self._last_psi_at = self._clock()
+                        self._psi_ever_established = True
 
                 audio_attempted = True
                 self.audio.start()
@@ -1279,4 +1366,7 @@ class DaemonRuntime:
             transition_sequence=self._transition_sequence,
             last_failure_at=self._last_failure_at,
             last_error=self._last_error,
+            last_psi_recovery_error=self._last_psi_recovery_error,
+            last_psi_recovery_action=self._last_psi_recovery_action,
+            inactive_psi_timeout_streak=self._inactive_psi_timeout_streak,
         )

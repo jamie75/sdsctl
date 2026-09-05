@@ -46,17 +46,20 @@ class FakeScanner:
         supports_bounded_reconnect: bool = True,
         psi_start_failures: int = 0,
         psi_start_failure: Literal["timeout", "rejected"] = "timeout",
+        reconnect_failures: int = 0,
     ) -> None:
         self.order = order
         self.fail_at = fail_at
         self._supports_bounded_reconnect = supports_bounded_reconnect
         self.psi_start_failures = psi_start_failures
         self.psi_start_failure = psi_start_failure
+        self.reconnect_failures = reconnect_failures
         self._connected = False
         self._psi_active = False
         self._psi_callbacks: list[Callable[[object], None]] = []
         self.state = FakeRadioState()
         self.close_calls = 0
+        self.reconnect_timeouts: list[float] = []
 
     @property
     def endpoint(self) -> str:
@@ -132,7 +135,11 @@ class FakeScanner:
 
     def reconnect(self, *, timeout: float = 2.0) -> None:
         assert 0 < timeout <= 2.0
+        self.reconnect_timeouts.append(timeout)
         self.order.append("scanner.reconnect")
+        if self.reconnect_failures > 0:
+            self.reconnect_failures -= 1
+            raise CommandTimeoutError("secret control reconnect timeout")
         self._connected = True
         self._psi_active = True
         self._emit_psi()
@@ -319,6 +326,204 @@ def test_runtime_psi_timeout_remains_strict_by_default() -> None:
     assert not snapshot.scanner_connected
     assert not snapshot.psi_active
     assert scanner.close_calls == 1
+
+    runtime.stop()
+
+
+def test_runtime_recovers_established_network_psi_without_restarting_audio() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    assert order.count("psi.start") == 1
+    assert runtime.snapshot().psi_active
+
+    # A transport reconnect can leave the scanner connected while the
+    # previously established PSI stream is inactive.
+    scanner._psi_active = False
+    now[0] = 100.1
+    runtime.poll()
+
+    recovered = runtime.snapshot()
+    assert recovered.state is DaemonRuntimeState.RUNNING
+    assert recovered.scanner_connected
+    assert recovered.psi_active
+    assert recovered.audio.running
+    assert recovered.router.running
+    assert order.count("psi.start") == 2
+    assert order.count("audio.start") == 1
+    assert "audio.stop" not in order
+    assert recovered.last_psi_recovery_error is None
+
+    runtime.stop()
+
+
+def test_runtime_first_inactive_psi_timeout_does_not_reconnect() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 1
+
+    now[0] = 100.1
+    runtime.poll()
+    assert order.count("psi.start") == 2
+    failed = runtime.snapshot()
+    assert failed.psi_active is False
+    assert failed.last_psi_recovery_error == "CommandTimeoutError"
+    assert failed.last_psi_recovery_action == "psi-start"
+    assert failed.inactive_psi_timeout_streak == 1
+    assert scanner.reconnect_timeouts == []
+
+    runtime.stop()
+
+
+def test_runtime_second_inactive_psi_timeout_escalates_once_and_restores_psi() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+
+    now[0] = 100.1
+    runtime.poll()
+    assert scanner.reconnect_timeouts == []
+    assert runtime.snapshot().inactive_psi_timeout_streak == 1
+
+    now[0] = 160.2
+    runtime.poll()
+
+    recovered = runtime.snapshot()
+    assert len(scanner.reconnect_timeouts) == 1
+    assert 0 < scanner.reconnect_timeouts[0] <= 2.0
+    assert recovered.state is DaemonRuntimeState.RUNNING
+    assert recovered.scanner_connected
+    assert recovered.psi_active
+    assert recovered.last_psi_recovery_error is None
+    assert recovered.last_psi_recovery_action == "control-reconnect"
+    assert recovered.inactive_psi_timeout_streak == 0
+    assert order.count("audio.start") == 1
+    assert "audio.stop" not in order
+
+    runtime.stop()
+
+
+def test_runtime_failed_control_reconnect_is_cooldown_limited() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, reconnect_failures=1)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+
+    now[0] = 100.1
+    runtime.poll()
+    now[0] = 160.2
+    runtime.poll()
+    failed = runtime.snapshot()
+    assert len(scanner.reconnect_timeouts) == 1
+    assert 0 < scanner.reconnect_timeouts[0] <= 2.0
+    assert not failed.psi_active
+    assert failed.last_psi_recovery_action == "control-reconnect"
+    assert failed.last_psi_recovery_error == "CommandTimeoutError"
+    assert failed.inactive_psi_timeout_streak == 2
+
+    now[0] = 160.3
+    runtime.poll()
+    assert len(scanner.reconnect_timeouts) == 1
+
+    # Once the existing cooldown expires, one further bounded escalation is
+    # allowed and the fake reconnect now succeeds.
+    now[0] = 220.3
+    runtime.poll()
+    assert len(scanner.reconnect_timeouts) == 2
+    assert all(0 < timeout <= 2.0 for timeout in scanner.reconnect_timeouts)
+    assert runtime.snapshot().psi_active
+    assert runtime.snapshot().inactive_psi_timeout_streak == 0
+
+    runtime.stop()
+
+
+def test_runtime_non_timeout_inactive_psi_failure_does_not_advance_streak() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, psi_start_failure="rejected")
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+
+    now[0] = 100.1
+    runtime.poll()
+    now[0] = 160.2
+    runtime.poll()
+
+    failed = runtime.snapshot()
+    assert failed.last_psi_recovery_error == "CommandRejectedError"
+    assert failed.last_psi_recovery_action == "psi-start"
+    assert failed.inactive_psi_timeout_streak == 0
+    assert scanner.reconnect_timeouts == []
 
     runtime.stop()
 
