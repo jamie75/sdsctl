@@ -417,6 +417,13 @@ def test_stream_maps_all_sources_into_one_ordered_event_sequence() -> None:
         "packets": 3,
         "samples": 480,
         "sinks": (),
+        "rtp_active": None,
+        "rtp_receiver_alive": None,
+        "rtsp_keepalive_alive": None,
+        "last_rtp_packet_age_seconds": None,
+        "audio_recovery_state": None,
+        "audio_recovery_count": None,
+        "last_audio_recovery_error": None,
     }
     assert events[5].payload == {
         "state": "active",

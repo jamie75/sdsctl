@@ -38,6 +38,32 @@ class AudioTransport(Protocol):
     def stop(self) -> None: ...
 
 
+@runtime_checkable
+class AudioTransportDiagnostics(Protocol):
+    """Optional liveness telemetry exposed by transports that support it."""
+
+    @property
+    def rtp_active(self) -> bool: ...
+
+    @property
+    def rtp_receiver_alive(self) -> bool: ...
+
+    @property
+    def rtsp_keepalive_alive(self) -> bool: ...
+
+    @property
+    def last_rtp_packet_age_seconds(self) -> float | None: ...
+
+    @property
+    def audio_recovery_state(self) -> str: ...
+
+    @property
+    def audio_recovery_count(self) -> int: ...
+
+    @property
+    def last_audio_recovery_error(self) -> str | None: ...
+
+
 class DisabledAudioTransport:
     """Represent an intentionally unavailable scanner audio source."""
 

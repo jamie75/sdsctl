@@ -54,6 +54,36 @@ class FakeAudioTransport:
         self._handler(chunk)
 
 
+class DiagnosticAudioTransport(FakeAudioTransport):
+    @property
+    def rtp_active(self) -> bool:
+        return True
+
+    @property
+    def rtp_receiver_alive(self) -> bool:
+        return True
+
+    @property
+    def rtsp_keepalive_alive(self) -> bool:
+        return True
+
+    @property
+    def last_rtp_packet_age_seconds(self) -> float | None:
+        return 0.25
+
+    @property
+    def audio_recovery_state(self) -> str:
+        return "healthy"
+
+    @property
+    def audio_recovery_count(self) -> int:
+        return 2
+
+    @property
+    def last_audio_recovery_error(self) -> str | None:
+        return None
+
+
 class CollectingSink:
     def __init__(self, name: str) -> None:
         self._name = name
@@ -200,6 +230,26 @@ class FakeSoundDeviceModule:
                 "default_samplerate": 44100.0,
             },
         )
+
+
+def test_audio_fanout_exposes_transport_liveness_diagnostics() -> None:
+    transport = DiagnosticAudioTransport()
+    sink = CollectingSink("diagnostic")
+    fanout = AudioFanoutSession(AudioStream(transport), (sink,))
+
+    fanout.start()
+    try:
+        snapshot = fanout.snapshot()
+        assert snapshot.running
+        assert snapshot.rtp_active
+        assert snapshot.rtp_receiver_alive
+        assert snapshot.rtsp_keepalive_alive
+        assert snapshot.last_rtp_packet_age_seconds == 0.25
+        assert snapshot.audio_recovery_state == "healthy"
+        assert snapshot.audio_recovery_count == 2
+        assert snapshot.last_audio_recovery_error is None
+    finally:
+        fanout.stop()
 
 
 def test_audio_fanout_decodes_once_for_multiple_sinks() -> None:

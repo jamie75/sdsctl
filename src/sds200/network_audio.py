@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Protocol
 
 from .audio import AudioChunk, AudioChunkHandler
@@ -34,6 +35,9 @@ from .socket_utils import (
 
 logger = logging.getLogger(__name__)
 MAX_RTP_DATAGRAM_SIZE = 65535
+DEFAULT_RTP_INACTIVITY_TIMEOUT = 60.0
+DEFAULT_AUDIO_RECOVERY_ATTEMPTS = 3
+DEFAULT_AUDIO_RECOVERY_BACKOFF = 1.0
 
 
 class AudioDatagramSocketLike(Protocol):
@@ -178,6 +182,9 @@ class NetworkAudioTransport:
         read_timeout: float = 0.2,
         rtsp_timeout: float = 5.0,
         keepalive_interval: float = 15.0,
+        inactivity_timeout: float = DEFAULT_RTP_INACTIVITY_TIMEOUT,
+        recovery_attempts: int = DEFAULT_AUDIO_RECOVERY_ATTEMPTS,
+        recovery_backoff: float = DEFAULT_AUDIO_RECOVERY_BACKOFF,
         datagram_socket_factory: AudioDatagramSocketFactory = (
             default_audio_datagram_socket_factory
         ),
@@ -202,6 +209,12 @@ class NetworkAudioTransport:
             raise ValueError("RTSP timeout must be greater than zero.")
         if keepalive_interval <= 0:
             raise ValueError("RTSP keepalive interval must be greater than zero.")
+        if inactivity_timeout <= 0:
+            raise ValueError("RTP inactivity timeout must be greater than zero.")
+        if type(recovery_attempts) is not int or recovery_attempts <= 0:
+            raise ValueError("Audio recovery attempts must be a positive integer.")
+        if recovery_backoff <= 0:
+            raise ValueError("Audio recovery backoff must be greater than zero.")
 
         self.host = host
         self.rtsp_port = rtsp_port
@@ -211,6 +224,9 @@ class NetworkAudioTransport:
         self.read_timeout = read_timeout
         self.rtsp_timeout = rtsp_timeout
         self.keepalive_interval = keepalive_interval
+        self.inactivity_timeout = inactivity_timeout
+        self.recovery_attempts = recovery_attempts
+        self.recovery_backoff = recovery_backoff
         self._datagram_socket_factory = datagram_socket_factory
         self._rtsp_client_factory = rtsp_client_factory
         self._local_address_resolver = local_address_resolver
@@ -221,6 +237,7 @@ class NetworkAudioTransport:
         self._receiver_thread: threading.Thread | None = None
         self._keepalive_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._lifecycle_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._rtsp_lock = threading.Lock()
         self._statistics_lock = threading.RLock()
@@ -229,6 +246,16 @@ class NetworkAudioTransport:
         self._timestamp_tracker = RtpTimestampTracker()
         self._expected_source: tuple[str, int] | None = None
         self._expected_ssrc: int | None = None
+        self._last_rtp_packet_monotonic: float | None = None
+        self._rtp_watchdog_started_monotonic: float | None = None
+        self._rtp_packet_seen_this_session = False
+        self._rtp_ever_received = False
+        self._last_keepalive_monotonic: float | None = None
+        self._audio_recovery_state = "stopped"
+        self._audio_recovery_count = 0
+        self._last_audio_recovery_error: str | None = None
+        self._recovery_active = False
+        self._recovery_thread: threading.Thread | None = None
 
     @property
     def endpoint(self) -> str:
@@ -240,7 +267,67 @@ class NetworkAudioTransport:
     @property
     def running(self) -> bool:
         with self._state_lock:
-            return self._rtp_socket is not None and self._rtsp_client is not None
+            receiver = self._receiver_thread
+            keepalive = self._keepalive_thread
+            return (
+                self._rtp_socket is not None
+                and self._rtsp_client is not None
+                and receiver is not None
+                and receiver.is_alive()
+                and keepalive is not None
+                and keepalive.is_alive()
+                and not self._stop.is_set()
+            )
+
+    @property
+    def rtp_receiver_alive(self) -> bool:
+        with self._state_lock:
+            return (
+                self._receiver_thread is not None
+                and self._receiver_thread.is_alive()
+            )
+
+    @property
+    def rtsp_keepalive_alive(self) -> bool:
+        with self._state_lock:
+            return (
+                self._keepalive_thread is not None
+                and self._keepalive_thread.is_alive()
+            )
+
+    @property
+    def last_rtp_packet_age_seconds(self) -> float | None:
+        with self._state_lock:
+            last_packet = self._last_rtp_packet_monotonic
+        if last_packet is None:
+            return None
+        return max(0.0, monotonic() - last_packet)
+
+    @property
+    def rtp_active(self) -> bool:
+        age = self.last_rtp_packet_age_seconds
+        return (
+            age is not None
+            and age < self.inactivity_timeout
+            and self._rtp_packet_seen_this_session
+            and self.rtp_receiver_alive
+            and self.audio_recovery_state == "healthy"
+        )
+
+    @property
+    def audio_recovery_state(self) -> str:
+        with self._state_lock:
+            return self._audio_recovery_state
+
+    @property
+    def audio_recovery_count(self) -> int:
+        with self._state_lock:
+            return self._audio_recovery_count
+
+    @property
+    def last_audio_recovery_error(self) -> str | None:
+        with self._state_lock:
+            return self._last_audio_recovery_error
 
     @property
     def statistics(self) -> NetworkAudioStatistics:
@@ -256,6 +343,15 @@ class NetworkAudioTransport:
         return self.events.subscribe("packet", callback)
 
     def start(self, handler: AudioChunkHandler) -> None:
+        with self._lifecycle_lock:
+            self._start_session(handler, reset_statistics=True)
+
+    def _start_session(
+        self,
+        handler: AudioChunkHandler,
+        *,
+        reset_statistics: bool,
+    ) -> None:
         with self._state_lock:
             if self._rtp_socket is not None:
                 return
@@ -263,8 +359,20 @@ class NetworkAudioTransport:
             self._stop.clear()
             self._sequence_tracker.reset()
             self._timestamp_tracker.reset()
-        with self._statistics_lock:
-            self._statistics = _MutableNetworkAudioStatistics()
+            if reset_statistics:
+                self._rtp_ever_received = False
+            self._last_rtp_packet_monotonic = None
+            self._rtp_watchdog_started_monotonic = (
+                monotonic() if not reset_statistics and self._rtp_ever_received else None
+            )
+            self._rtp_packet_seen_this_session = False
+            self._last_keepalive_monotonic = None
+            self._audio_recovery_state = "starting"
+            if reset_statistics:
+                self._last_audio_recovery_error = None
+        if reset_statistics:
+            with self._statistics_lock:
+                self._statistics = _MutableNetworkAudioStatistics()
 
         rtp_socket: AudioDatagramSocketLike | None = None
         rtsp_client: RtspSessionClientLike | None = None
@@ -299,6 +407,10 @@ class NetworkAudioTransport:
             if rtp_socket is not None:
                 with suppress(OSError):
                     rtp_socket.close()
+            with self._state_lock:
+                self._handler = None
+                self._audio_recovery_state = "failed"
+                self._last_audio_recovery_error = exc.__class__.__name__
             raise ScannerConnectionError(
                 f"Could not start SDS200 network audio at {self.endpoint}."
             ) from exc
@@ -326,40 +438,45 @@ class NetworkAudioTransport:
             )
             receiver = self._receiver_thread
             keepalive = self._keepalive_thread
+            self._audio_recovery_state = "healthy"
         assert receiver is not None
         assert keepalive is not None
         receiver.start()
         keepalive.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        with self._state_lock:
-            rtp_socket, self._rtp_socket = self._rtp_socket, None
-            rtsp_client, self._rtsp_client = self._rtsp_client, None
-            receiver, self._receiver_thread = self._receiver_thread, None
-            keepalive, self._keepalive_thread = self._keepalive_thread, None
+        with self._lifecycle_lock:
+            self._stop.set()
+            with self._state_lock:
+                rtp_socket, self._rtp_socket = self._rtp_socket, None
+                rtsp_client, self._rtsp_client = self._rtsp_client, None
+                receiver, self._receiver_thread = self._receiver_thread, None
+                keepalive, self._keepalive_thread = self._keepalive_thread, None
 
-        if rtsp_client is not None:
-            with self._rtsp_lock:
-                with suppress(Exception):
-                    rtsp_client.teardown()
-                    with self._statistics_lock:
-                        self._statistics.teardowns_sent += 1
-                with suppress(Exception):
-                    rtsp_client.close()
-        if rtp_socket is not None:
-            with suppress(OSError):
-                rtp_socket.close()
+            if rtsp_client is not None:
+                with self._rtsp_lock:
+                    with suppress(Exception):
+                        rtsp_client.teardown()
+                        with self._statistics_lock:
+                            self._statistics.teardowns_sent += 1
+                    with suppress(Exception):
+                        rtsp_client.close()
+            if rtp_socket is not None:
+                with suppress(OSError):
+                    rtp_socket.close()
 
-        current = threading.current_thread()
-        for thread in (receiver, keepalive):
-            if thread is not None and thread is not current:
-                thread.join(timeout=max(1.0, self.read_timeout * 4))
-        self._handler = None
-        self._sequence_tracker.reset()
-        self._timestamp_tracker.reset()
-        self._expected_source = None
-        self._expected_ssrc = None
+            current = threading.current_thread()
+            for thread in (receiver, keepalive):
+                if thread is not None and thread is not current:
+                    thread.join(timeout=max(1.0, self.read_timeout * 4))
+            with self._state_lock:
+                self._handler = None
+                self._sequence_tracker.reset()
+                self._timestamp_tracker.reset()
+                self._expected_source = None
+                self._expected_ssrc = None
+                if not self._recovery_active:
+                    self._audio_recovery_state = "stopped"
 
     def _receiver_loop(self) -> None:
         while not self._stop.is_set():
@@ -376,6 +493,7 @@ class NetworkAudioTransport:
                     with self._statistics_lock:
                         self._statistics.receive_errors += 1
                     logger.exception("SDS200 RTP socket failed for %s", self.endpoint)
+                    self._request_audio_recovery("rtp_receive_error", None)
                 return
             if self._stop.is_set() or not datagram:
                 continue
@@ -469,6 +587,11 @@ class NetworkAudioTransport:
                     statistics.first_sequence = packet.sequence
                 statistics.last_sequence = packet.sequence
                 statistics.last_timestamp = packet.timestamp
+            with self._state_lock:
+                self._last_rtp_packet_monotonic = monotonic()
+                self._rtp_watchdog_started_monotonic = None
+                self._rtp_packet_seen_this_session = True
+                self._rtp_ever_received = True
 
             observed_at = datetime.now(UTC)
             self.events.emit(
@@ -514,9 +637,118 @@ class NetworkAudioTransport:
                     rtsp_client.get_parameter()
                 with self._statistics_lock:
                     self._statistics.keepalives_sent += 1
+                with self._state_lock:
+                    self._last_keepalive_monotonic = monotonic()
+                if self._rtp_has_been_inactive():
+                    self._request_audio_recovery("rtp_inactive", None)
+                    return
             except (OSError, RtspProtocolError, ScannerConnectionError):
                 if not self._stop.is_set():
                     with self._statistics_lock:
                         self._statistics.keepalive_failures += 1
                     logger.exception("SDS200 RTSP keepalive failed for %s", self.endpoint)
+                    self._request_audio_recovery("rtsp_keepalive_failure", None)
                 return
+
+    def _rtp_has_been_inactive(self) -> bool:
+        with self._state_lock:
+            last_packet = (
+                self._last_rtp_packet_monotonic
+                or self._rtp_watchdog_started_monotonic
+            )
+        return (
+            last_packet is not None
+            and monotonic() - last_packet >= self.inactivity_timeout
+        )
+
+    def _request_audio_recovery(
+        self,
+        reason: str,
+        error: BaseException | None,
+    ) -> None:
+        with self._state_lock:
+            if self._stop.is_set() or self._recovery_active:
+                return
+            self._recovery_active = True
+            self._audio_recovery_count += 1
+            self._audio_recovery_state = "recovering"
+            self._last_audio_recovery_error = (
+                error.__class__.__name__ if error is not None else reason
+            )
+            handler = self._handler
+            recovery_thread = threading.Thread(
+                target=self._recover_audio,
+                args=(handler, reason),
+                name="sds200-audio-recovery",
+                daemon=True,
+            )
+            self._recovery_thread = recovery_thread
+        logger.warning(
+            "SDS200 network audio recovery requested endpoint=%s reason=%s",
+            self.endpoint,
+            reason,
+        )
+        recovery_thread.start()
+
+    def _recover_audio(
+        self,
+        handler: AudioChunkHandler | None,
+        reason: str,
+    ) -> None:
+        failure: BaseException | None = None
+        if handler is None:
+            failure = ScannerConnectionError("Audio recovery has no active handler.")
+        else:
+            for attempt in range(1, self.recovery_attempts + 1):
+                if attempt > 1 and self._stop.wait(
+                    min(self.recovery_backoff * (2 ** (attempt - 2)), 10.0)
+                ):
+                    self._finish_audio_recovery()
+                    return
+                if self._stop.is_set():
+                    self._finish_audio_recovery()
+                    return
+                try:
+                    with self._lifecycle_lock:
+                        if self._stop.is_set():
+                            self._finish_audio_recovery()
+                            return
+                        self.stop()
+                        self._start_session(handler, reset_statistics=False)
+                    self._finish_audio_recovery()
+                    logger.info(
+                        "SDS200 network audio recovery completed endpoint=%s "
+                        "reason=%s attempt=%d",
+                        self.endpoint,
+                        reason,
+                        attempt,
+                    )
+                    return
+                except ScannerConnectionError as error:
+                    failure = error
+                    logger.warning(
+                        "SDS200 network audio recovery failed endpoint=%s "
+                        "reason=%s attempt=%d error=%s",
+                        self.endpoint,
+                        reason,
+                        attempt,
+                        error.__class__.__name__,
+                    )
+        with self._state_lock:
+            self._audio_recovery_state = "failed"
+            self._last_audio_recovery_error = (
+                failure.__class__.__name__ if failure is not None else reason
+            )
+        self._finish_audio_recovery()
+        logger.error(
+            "SDS200 network audio recovery exhausted endpoint=%s reason=%s",
+            self.endpoint,
+            reason,
+        )
+
+    def _finish_audio_recovery(self) -> None:
+        with self._state_lock:
+            self._recovery_active = False
+            self._recovery_thread = None
+            if self._stop.is_set():
+                self._audio_recovery_state = "stopped"

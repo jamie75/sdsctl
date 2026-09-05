@@ -403,6 +403,188 @@ def test_network_audio_packet_listener_can_unsubscribe() -> None:
     assert packets == []
     assert chunks[0].data == b"accepted"
 
+
+class RecoveryRtspClient(FakeRtspClient):
+    def __init__(
+        self,
+        *,
+        fail_keepalive: bool = False,
+        fail_start: bool = False,
+    ) -> None:
+        super().__init__()
+        self.fail_keepalive = fail_keepalive
+        self.fail_start = fail_start
+
+    def start(self, client_port: int) -> RtpTransportInfo:
+        if self.fail_start:
+            raise OSError("simulated RTSP start failure")
+        return super().start(client_port)
+
+    def get_parameter(self) -> object:
+        if self.fail_keepalive:
+            raise OSError("simulated RTSP keepalive failure")
+        return super().get_parameter()
+
+
+def test_network_audio_recovers_after_keepalive_failure_without_losing_handler() -> None:
+    datagrams = [FakeAudioDatagramSocket(), FakeAudioDatagramSocket()]
+    clients = [
+        RecoveryRtspClient(fail_keepalive=True),
+        RecoveryRtspClient(),
+    ]
+
+    datagram_iter = iter(datagrams)
+    client_iter = iter(clients)
+
+    def datagram_factory(
+        family: int,
+        socket_type: int,
+    ) -> FakeAudioDatagramSocket:
+        del family, socket_type
+        return next(datagram_iter)
+
+    def client_factory(
+        host: str,
+        port: int,
+        path: str,
+        timeout: float,
+    ) -> RecoveryRtspClient:
+        del host, port, path, timeout
+        return next(client_iter)
+
+    chunks: list[AudioChunk] = []
+    transport = NetworkAudioTransport(
+        "192.0.2.25",
+        keepalive_interval=0.01,
+        recovery_attempts=2,
+        recovery_backoff=0.01,
+        datagram_socket_factory=datagram_factory,
+        rtsp_client_factory=client_factory,
+        local_address_resolver=lambda _host, _port: "192.0.2.10",
+    )
+    transport.start(chunks.append)
+    try:
+        datagrams[0].feed(make_rtp(b"before"))
+        wait_until(lambda: len(chunks) == 1)
+        wait_until(lambda: transport.audio_recovery_count == 1)
+        wait_until(lambda: transport.audio_recovery_state == "healthy")
+        datagrams[0].feed(make_rtp(b"stale"))
+        datagrams[1].feed(make_rtp(b"after"))
+        wait_until(lambda: [chunk.data for chunk in chunks] == [b"before", b"after"])
+        assert transport.statistics.sessions_started == 2
+        assert transport.statistics.keepalive_failures == 1
+        assert transport.rtp_active
+        assert transport.running
+    finally:
+        transport.stop()
+
+    assert datagrams[0].closed
+    assert datagrams[1].closed
+    assert clients[0].teardowns == 1
+    assert clients[1].teardowns == 1
+
+
+def test_network_audio_recovers_after_bounded_rtp_inactivity() -> None:
+    datagrams = [FakeAudioDatagramSocket(), FakeAudioDatagramSocket()]
+    clients = [RecoveryRtspClient(), RecoveryRtspClient()]
+
+    datagram_iter = iter(datagrams)
+    client_iter = iter(clients)
+
+    def datagram_factory(
+        family: int,
+        socket_type: int,
+    ) -> FakeAudioDatagramSocket:
+        del family, socket_type
+        return next(datagram_iter)
+
+    def client_factory(
+        host: str,
+        port: int,
+        path: str,
+        timeout: float,
+    ) -> RecoveryRtspClient:
+        del host, port, path, timeout
+        return next(client_iter)
+
+    chunks: list[AudioChunk] = []
+    transport = NetworkAudioTransport(
+        "192.0.2.25",
+        keepalive_interval=0.01,
+        inactivity_timeout=0.05,
+        recovery_attempts=2,
+        recovery_backoff=0.01,
+        datagram_socket_factory=datagram_factory,
+        rtsp_client_factory=client_factory,
+        local_address_resolver=lambda _host, _port: "192.0.2.10",
+    )
+    transport.start(chunks.append)
+    try:
+        datagrams[0].feed(make_rtp(b"before"))
+        wait_until(lambda: len(chunks) == 1)
+        wait_until(lambda: transport.audio_recovery_count == 1, timeout=2.0)
+        wait_until(lambda: transport.audio_recovery_state == "healthy")
+        datagrams[1].feed(make_rtp(b"after"))
+        wait_until(lambda: len(chunks) == 2)
+        assert transport.statistics.sessions_started == 2
+        assert transport.rtp_active
+    finally:
+        transport.stop()
+
+
+def test_network_audio_recovery_attempts_are_bounded_after_start_failure() -> None:
+    datagrams = [
+        FakeAudioDatagramSocket(),
+        FakeAudioDatagramSocket(),
+        FakeAudioDatagramSocket(),
+    ]
+    clients = [
+        RecoveryRtspClient(fail_keepalive=True),
+        RecoveryRtspClient(fail_start=True),
+        RecoveryRtspClient(fail_start=True),
+    ]
+
+    datagram_iter = iter(datagrams)
+    client_iter = iter(clients)
+
+    def datagram_factory(
+        family: int,
+        socket_type: int,
+    ) -> FakeAudioDatagramSocket:
+        del family, socket_type
+        return next(datagram_iter)
+
+    def client_factory(
+        host: str,
+        port: int,
+        path: str,
+        timeout: float,
+    ) -> RecoveryRtspClient:
+        del host, port, path, timeout
+        return next(client_iter)
+
+    transport = NetworkAudioTransport(
+        "192.0.2.25",
+        keepalive_interval=0.01,
+        recovery_attempts=2,
+        recovery_backoff=0.01,
+        datagram_socket_factory=datagram_factory,
+        rtsp_client_factory=client_factory,
+        local_address_resolver=lambda _host, _port: "192.0.2.10",
+    )
+    transport.start(lambda _chunk: None)
+    try:
+        datagrams[0].feed(make_rtp(b"trigger"))
+        wait_until(lambda: transport.audio_recovery_count == 1)
+        wait_until(lambda: transport.audio_recovery_state == "failed", timeout=2.0)
+        assert transport.audio_recovery_count == 1
+        assert transport.statistics.sessions_started == 1
+        assert not transport.running
+        time.sleep(0.05)
+        assert transport.audio_recovery_count == 1
+    finally:
+        transport.stop()
+
 def test_network_audio_rejects_wildcard_bind_address() -> None:
     with pytest.raises(ValueError, match="must not bind all network interfaces"):
         NetworkAudioTransport("192.0.2.25", local_host="0.0.0.0")

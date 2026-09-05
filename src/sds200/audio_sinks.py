@@ -11,7 +11,7 @@ from math import isfinite
 from time import monotonic
 from typing import Literal, Protocol, Self, cast, runtime_checkable
 
-from .audio import AudioChunk, AudioStream
+from .audio import AudioChunk, AudioStream, AudioTransportDiagnostics
 from .audio_recording import (
     PCM_CHANNELS,
     PCM_SAMPLE_WIDTH,
@@ -503,6 +503,13 @@ class AudioFanoutSnapshot:
     packets: int
     samples: int
     sinks: tuple[tuple[str, PcmSinkStatistics], ...]
+    rtp_active: bool | None = None
+    rtp_receiver_alive: bool | None = None
+    rtsp_keepalive_alive: bool | None = None
+    last_rtp_packet_age_seconds: float | None = None
+    audio_recovery_state: str | None = None
+    audio_recovery_count: int | None = None
+    last_audio_recovery_error: str | None = None
 
     @property
     def audio_duration_seconds(self) -> float:
@@ -603,12 +610,36 @@ class AudioFanoutSession:
                 (name, PcmSinkStatistics())
                 for name in self._sink_names
             )
+        transport = self.stream.transport
+        if isinstance(transport, AudioTransportDiagnostics):
+            rtp_active = transport.rtp_active
+            rtp_receiver_alive = transport.rtp_receiver_alive
+            rtsp_keepalive_alive = transport.rtsp_keepalive_alive
+            last_rtp_packet_age_seconds = transport.last_rtp_packet_age_seconds
+            audio_recovery_state = transport.audio_recovery_state
+            audio_recovery_count = transport.audio_recovery_count
+            last_audio_recovery_error = transport.last_audio_recovery_error
+        else:
+            rtp_active = None
+            rtp_receiver_alive = None
+            rtsp_keepalive_alive = None
+            last_rtp_packet_age_seconds = None
+            audio_recovery_state = None
+            audio_recovery_count = None
+            last_audio_recovery_error = None
         return AudioFanoutSnapshot(
             endpoint=self.stream.endpoint,
             running=self.running,
             packets=packets,
             samples=samples,
             sinks=sink_statistics,
+            rtp_active=rtp_active,
+            rtp_receiver_alive=rtp_receiver_alive,
+            rtsp_keepalive_alive=rtsp_keepalive_alive,
+            last_rtp_packet_age_seconds=last_rtp_packet_age_seconds,
+            audio_recovery_state=audio_recovery_state,
+            audio_recovery_count=audio_recovery_count,
+            last_audio_recovery_error=last_audio_recovery_error,
         )
 
     def start(self) -> None:

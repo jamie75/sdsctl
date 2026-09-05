@@ -210,6 +210,27 @@ def test_pcmu_server_sends_complete_versioned_frame(
     assert not path.exists()
 
 
+def test_pcmu_server_removes_idle_disconnected_client_without_publication(
+    tmp_path: Path,
+) -> None:
+    stream = FakePcmuStream()
+    server, path = make_server(
+        tmp_path,
+        stream,
+        accept_poll_interval=0.02,
+    )
+    server.start()
+    client = connect(path)
+
+    try:
+        wait_until(lambda: stream.subscriber_count == 1)
+        client.close()
+        wait_until(lambda: server.connected_clients == 0)
+        wait_until(lambda: stream.subscriber_count == 0)
+    finally:
+        server.stop()
+
+
 def test_pcmu_server_gives_clients_independent_subscriptions(
     tmp_path: Path,
 ) -> None:
