@@ -580,18 +580,29 @@ class DaemonRuntime:
             with self._state_lock:
                 self._last_psi_recovery_at = completed_at
                 self._last_psi_recovery_error = _redacted_error_type(error)
+                self._last_psi_recovery_action = "reconnect"
+                if isinstance(error, CommandTimeoutError):
+                    self._inactive_psi_timeout_streak += 1
+                else:
+                    self._inactive_psi_timeout_streak = 0
+                timeout_streak = self._inactive_psi_timeout_streak
             logger.warning(
-                "daemon PSI recovery failed scanner=%s error=%s",
+                "daemon PSI recovery failed scanner=%s action=reconnect "
+                "error=%s timeout_streak=%d/%d",
                 self.scanner.endpoint,
                 error.__class__.__name__,
+                timeout_streak,
+                _INACTIVE_PSI_TIMEOUT_ESCALATION_THRESHOLD,
             )
         else:
             completed_at = self._clock()
             with self._state_lock:
                 self._last_psi_recovery_at = completed_at
                 self._last_psi_recovery_error = None
+                self._last_psi_recovery_action = "reconnect"
             logger.info(
-                "daemon PSI recovery completed scanner=%s",
+                "daemon PSI recovery completed scanner=%s action=reconnect; "
+                "awaiting fresh PSI confirmation",
                 self.scanner.endpoint,
             )
 
@@ -916,9 +927,10 @@ class DaemonRuntime:
     def _escalate_inactive_psi_recovery(self, timeout_streak: int) -> None:
         logger.warning(
             "daemon PSI recovery escalating scanner=%s "
-            "attempting_recovery=control-reconnect timeout_streak=%d",
+            "attempting_recovery=control-reconnect timeout_streak=%d/%d",
             self.scanner.endpoint,
             timeout_streak,
+            _INACTIVE_PSI_TIMEOUT_ESCALATION_THRESHOLD,
         )
         try:
             self.reconnect(timeout=2.0)
@@ -940,12 +952,10 @@ class DaemonRuntime:
             completed_at = self._clock()
             with self._state_lock:
                 self._last_psi_recovery_at = completed_at
-                self._last_psi_recovery_error = None
                 self._last_psi_recovery_action = "control-reconnect"
-                self._inactive_psi_timeout_streak = 0
             logger.info(
                 "daemon control reconnect escalation completed "
-                "scanner=%s",
+                "scanner=%s; awaiting fresh PSI confirmation",
                 self.scanner.endpoint,
             )
 

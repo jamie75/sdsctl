@@ -47,6 +47,7 @@ class FakeScanner:
         psi_start_failures: int = 0,
         psi_start_failure: Literal["timeout", "rejected"] = "timeout",
         reconnect_failures: int = 0,
+        emit_psi_on_reconnect: bool = True,
     ) -> None:
         self.order = order
         self.fail_at = fail_at
@@ -54,6 +55,7 @@ class FakeScanner:
         self.psi_start_failures = psi_start_failures
         self.psi_start_failure = psi_start_failure
         self.reconnect_failures = reconnect_failures
+        self.emit_psi_on_reconnect = emit_psi_on_reconnect
         self._connected = False
         self._psi_active = False
         self._psi_callbacks: list[Callable[[object], None]] = []
@@ -142,7 +144,8 @@ class FakeScanner:
             raise CommandTimeoutError("secret control reconnect timeout")
         self._connected = True
         self._psi_active = True
-        self._emit_psi()
+        if self.emit_psi_on_reconnect:
+            self._emit_psi()
 
     def stop_scanner_info_push(self) -> None:
         self.order.append("psi.stop")
@@ -442,6 +445,91 @@ def test_runtime_second_inactive_psi_timeout_escalates_once_and_restores_psi() -
     assert recovered.inactive_psi_timeout_streak == 0
     assert order.count("audio.start") == 1
     assert "audio.stop" not in order
+
+    runtime.stop()
+
+
+def test_runtime_stale_and_inactive_timeout_failures_share_escalation_streak() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, reconnect_failures=1, emit_psi_on_reconnect=False)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner.psi_start_failures = 1
+
+    # The first timeout is in the stale-PSI reconnect branch.
+    now[0] = 110.1
+    runtime.poll()
+    assert runtime.snapshot().inactive_psi_timeout_streak == 1
+    assert len(scanner.reconnect_timeouts) == 1
+
+    # The second timeout is in the inactive-PSI restart branch and must
+    # escalate because it follows the stale-branch timeout.
+    scanner._psi_active = False
+    now[0] = 170.2
+    runtime.poll()
+    assert len(scanner.reconnect_timeouts) == 2
+    assert runtime.snapshot().inactive_psi_timeout_streak == 2
+    assert runtime.snapshot().last_psi_recovery_action == "control-reconnect"
+    assert order.count("audio.start") == 1
+    assert "audio.stop" not in order
+
+    # Only a fresh PSI frame clears the streak after reconnect succeeded.
+    scanner._psi_active = True
+    scanner._emit_psi()
+    assert runtime.snapshot().inactive_psi_timeout_streak == 0
+    assert runtime.snapshot().last_psi_recovery_error is None
+
+    runtime.stop()
+
+
+def test_runtime_control_reconnect_success_waits_for_fresh_psi_to_clear_failure() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, emit_psi_on_reconnect=False)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+
+    now[0] = 100.1
+    runtime.poll()
+    now[0] = 160.2
+    runtime.poll()
+
+    pending = runtime.snapshot()
+    assert pending.psi_active is True
+    assert pending.inactive_psi_timeout_streak == 2
+    assert pending.last_psi_recovery_error == "CommandTimeoutError"
+    assert pending.last_psi_recovery_action == "control-reconnect"
+
+    scanner._psi_active = True
+    scanner._emit_psi()
+    recovered = runtime.snapshot()
+    assert recovered.inactive_psi_timeout_streak == 0
+    assert recovered.last_psi_recovery_error is None
 
     runtime.stop()
 
