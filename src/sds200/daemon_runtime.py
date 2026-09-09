@@ -208,6 +208,7 @@ class DaemonRuntimeSnapshot:
     scanner_connected: bool
     psi_interval_ms: int
     psi_active: bool
+    psi_age_seconds: float | None
     radio_state: RadioStateSnapshot
     audio: AudioFanoutSnapshot
     router: PcmSinkRouterSnapshot
@@ -240,6 +241,7 @@ class DaemonRuntimeSnapshot:
             "scanner_connected": self.scanner_connected,
             "psi_interval_ms": self.psi_interval_ms,
             "psi_active": self.psi_active,
+            "psi_age_seconds": self.psi_age_seconds,
             "radio_state": asdict(self.radio_state),
             "audio": asdict(self.audio),
             "router": self.router.as_dict(),
@@ -1493,6 +1495,11 @@ class DaemonRuntime:
             scanner_connected=self.scanner.connected,
             psi_interval_ms=self.psi_interval_ms,
             psi_active=self.scanner.psi_active,
+            psi_age_seconds=(
+                None
+                if self._last_psi_at is None
+                else max(0.0, self._clock() - self._last_psi_at)
+            ),
             radio_state=self.scanner.state.snapshot,
             audio=self.audio.lifecycle_snapshot(),
             router=self.router.lifecycle_snapshot(),

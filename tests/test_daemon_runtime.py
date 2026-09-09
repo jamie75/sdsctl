@@ -335,9 +335,42 @@ def test_runtime_psi_timeout_remains_strict_by_default() -> None:
     assert not snapshot.scanner_connected
     assert not snapshot.psi_active
     assert scanner.close_calls == 1
+    assert snapshot.psi_age_seconds is None
 
     runtime.stop()
 
+def test_runtime_snapshot_exposes_monotonic_psi_age_and_none_before_psi() -> None:
+    runtime, _, _, _, _ = make_runtime()
+
+    assert runtime.snapshot().psi_age_seconds is None
+
+    runtime.start()
+    runtime_snapshot = runtime.snapshot()
+
+    assert runtime_snapshot.psi_age_seconds is not None
+    assert 0.0 <= runtime_snapshot.psi_age_seconds < 0.1
+    assert runtime_snapshot.as_dict()["psi_age_seconds"] == pytest.approx(
+        runtime_snapshot.psi_age_seconds
+    )
+
+    runtime.stop()
+
+
+def test_runtime_snapshot_psi_age_tracks_psi_observation() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(scanner, audio, router, clock=lambda: now[0])
+
+    runtime.start()
+    now[0] = 100.75
+
+    assert runtime.snapshot().psi_age_seconds == pytest.approx(0.75)
+
+    runtime.stop()
 
 def test_runtime_recovers_established_network_psi_without_restarting_audio() -> None:
     now = [100.0]

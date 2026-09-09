@@ -60,6 +60,7 @@ def snapshot_payload() -> dict[str, object]:
         "scanner_connected": True,
         "psi_interval_ms": 500,
         "psi_active": True,
+        "psi_age_seconds": 0.5,
         "radio_state": {
             "system": "Metro",
             "department": "Dispatch",
