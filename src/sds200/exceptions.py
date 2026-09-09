@@ -69,6 +69,10 @@ class DaemonControlUnavailableError(SDS200Error):
     """A daemon-owned scanner control cannot run in the current runtime state."""
 
 
+class RecoveryExhaustedError(SDS200Error):
+    """The daemon exhausted bounded scanner recovery and must be restarted."""
+
+
 class DaemonIpcError(SDS200Error):
     """The local daemon IPC endpoint could not be owned or operated safely."""
 

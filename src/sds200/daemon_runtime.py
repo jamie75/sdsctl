@@ -24,6 +24,7 @@ from .exceptions import (
     CommandTimeoutError,
     DaemonControlBusyError,
     DaemonControlUnavailableError,
+    RecoveryExhaustedError,
     UnsupportedScannerFeatureError,
 )
 from .models import ScannerInfo
@@ -31,6 +32,8 @@ from .state import RadioStateSnapshot
 from .waterfall_session import WaterfallSessionState
 
 logger = logging.getLogger(__name__)
+
+_CONTROL_RECONNECT_FAILURE_BUDGET = 3
 
 
 class DaemonRuntimeState(StrEnum):
@@ -217,6 +220,8 @@ class DaemonRuntimeSnapshot:
     last_psi_recovery_error: str | None = None
     last_psi_recovery_action: str | None = None
     inactive_psi_timeout_streak: int = 0
+    control_reconnect_failure_streak: int = 0
+    process_recovery_requested: bool = False
 
     @property
     def active(self) -> bool:
@@ -259,6 +264,10 @@ class DaemonRuntimeSnapshot:
             "last_psi_recovery_error": self.last_psi_recovery_error,
             "last_psi_recovery_action": self.last_psi_recovery_action,
             "inactive_psi_timeout_streak": self.inactive_psi_timeout_streak,
+            "control_reconnect_failure_streak": (
+                self.control_reconnect_failure_streak
+            ),
+            "process_recovery_requested": self.process_recovery_requested,
         }
 
 
@@ -416,6 +425,8 @@ class DaemonRuntime:
         self._last_psi_recovery_error: str | None = None
         self._last_psi_recovery_action: str | None = None
         self._inactive_psi_timeout_streak = 0
+        self._control_reconnect_failure_streak = 0
+        self._process_recovery_requested = False
 
     @property
     def running(self) -> bool:
@@ -705,6 +716,9 @@ class DaemonRuntime:
             self._last_psi_at = self._clock()
             self._inactive_psi_timeout_streak = 0
             self._last_psi_recovery_error = None
+            self._last_psi_recovery_action = None
+            self._control_reconnect_failure_streak = 0
+            self._process_recovery_requested = False
 
     def hold_state(
         self,
@@ -942,12 +956,18 @@ class DaemonRuntime:
                 self._last_psi_recovery_at = completed_at
                 self._last_psi_recovery_error = _redacted_error_type(error)
                 self._last_psi_recovery_action = "control-reconnect"
+                self._control_reconnect_failure_streak += 1
+                reconnect_failures = self._control_reconnect_failure_streak
             logger.warning(
-                "daemon control reconnect escalation failed "
+                "daemon control reconnect attempt %d/%d failed "
                 "scanner=%s error=%s",
+                reconnect_failures,
+                _CONTROL_RECONNECT_FAILURE_BUDGET,
                 self.scanner.endpoint,
                 error.__class__.__name__,
             )
+            if reconnect_failures >= _CONTROL_RECONNECT_FAILURE_BUDGET:
+                self._request_process_recovery(reconnect_failures)
         else:
             completed_at = self._clock()
             with self._state_lock:
@@ -958,6 +978,26 @@ class DaemonRuntime:
                 "scanner=%s; awaiting fresh PSI confirmation",
                 self.scanner.endpoint,
             )
+
+    def _request_process_recovery(self, reconnect_failures: int) -> None:
+        with self._state_lock:
+            if self._process_recovery_requested:
+                return
+            self._process_recovery_requested = True
+        logger.critical(
+            "daemon recovery exhausted scanner=%s psi_active=%s "
+            "timeout_streak=%d control_reconnect_failures=%d/%d; "
+            "requesting process restart via controlled non-zero exit",
+            self.scanner.endpoint,
+            self.scanner.psi_active,
+            self._inactive_psi_timeout_streak,
+            reconnect_failures,
+            _CONTROL_RECONNECT_FAILURE_BUDGET,
+        )
+        raise RecoveryExhaustedError(
+            "Daemon scanner recovery exhausted after "
+            f"{reconnect_failures} control reconnect failures."
+        )
 
     def _refresh_psi(self) -> None:
         """Restart only the active PSI push without reopening scanner control."""
@@ -1379,4 +1419,8 @@ class DaemonRuntime:
             last_psi_recovery_error=self._last_psi_recovery_error,
             last_psi_recovery_action=self._last_psi_recovery_action,
             inactive_psi_timeout_streak=self._inactive_psi_timeout_streak,
+            control_reconnect_failure_streak=(
+                self._control_reconnect_failure_streak
+            ),
+            process_recovery_requested=self._process_recovery_requested,
         )

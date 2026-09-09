@@ -20,7 +20,11 @@ from sds200.daemon_runtime import (
     DaemonRuntimeState,
     DaemonRuntimeTransition,
 )
-from sds200.exceptions import CommandRejectedError, CommandTimeoutError
+from sds200.exceptions import (
+    CommandRejectedError,
+    CommandTimeoutError,
+    RecoveryExhaustedError,
+)
 from sds200.state import RadioStateSnapshot
 from sds200.waterfall_session import WaterfallSessionState
 
@@ -530,6 +534,88 @@ def test_runtime_control_reconnect_success_waits_for_fresh_psi_to_clear_failure(
     recovered = runtime.snapshot()
     assert recovered.inactive_psi_timeout_streak == 0
     assert recovered.last_psi_recovery_error is None
+
+    runtime.stop()
+
+
+def test_runtime_exits_after_three_failed_control_reconnect_escalations(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, reconnect_failures=3)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+
+    now[0] = 100.1
+    runtime.poll()
+    now[0] = 160.2
+    runtime.poll()
+    now[0] = 220.3
+    runtime.poll()
+    with pytest.raises(RecoveryExhaustedError):
+        now[0] = 280.4
+        runtime.poll()
+
+    snapshot = runtime.snapshot()
+    assert len(scanner.reconnect_timeouts) == 3
+    assert snapshot.control_reconnect_failure_streak == 3
+    assert snapshot.process_recovery_requested is True
+    assert order.count("audio.start") == 1
+    assert "audio.stop" not in order
+
+    runtime._request_process_recovery(3)  # type: ignore[attr-defined]
+    runtime._request_process_recovery(3)  # type: ignore[attr-defined]
+    assert caplog.text.count("requesting process restart") == 1
+
+    runtime.stop()
+
+
+def test_runtime_fresh_psi_cancels_process_recovery_before_budget() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, reconnect_failures=2)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+    now[0] = 100.1
+    runtime.poll()
+    now[0] = 160.2
+    runtime.poll()
+    assert runtime.snapshot().control_reconnect_failure_streak == 1
+
+    scanner._emit_psi()
+    snapshot = runtime.snapshot()
+    assert snapshot.inactive_psi_timeout_streak == 0
+    assert snapshot.control_reconnect_failure_streak == 0
+    assert snapshot.process_recovery_requested is False
+    assert snapshot.last_psi_recovery_error is None
+    assert snapshot.last_psi_recovery_action is None
 
     runtime.stop()
 

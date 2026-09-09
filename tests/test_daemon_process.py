@@ -10,6 +10,7 @@ from sds200.daemon_process import (
     DaemonProcess,
     DaemonSignalController,
 )
+from sds200.exceptions import RecoveryExhaustedError
 
 
 class FakeRuntime:
@@ -19,10 +20,12 @@ class FakeRuntime:
         *,
         start_error: BaseException | None = None,
         stop_error: BaseException | None = None,
+        poll_error: BaseException | None = None,
     ) -> None:
         self.order = order
         self.start_error = start_error
         self.stop_error = stop_error
+        self.poll_error = poll_error
         self.start_calls = 0
         self.poll_calls = 0
         self.stop_calls = 0
@@ -35,6 +38,8 @@ class FakeRuntime:
 
     def poll(self) -> None:
         self.poll_calls += 1
+        if self.poll_error is not None:
+            raise self.poll_error
 
     def stop(self) -> None:
         self.order.append("runtime.stop")
@@ -629,6 +634,30 @@ def test_process_stops_after_wait_failure() -> None:
         ).run()
 
     assert raised.value is wait_error
+    assert order == [
+        "signals.enter",
+        "runtime.start",
+        "signals.wait",
+        "runtime.stop",
+        "signals.exit",
+    ]
+
+
+def test_process_cleans_up_and_propagates_recovery_exhaustion() -> None:
+    order: list[str] = []
+    failure = RecoveryExhaustedError("recovery exhausted")
+    runtime = FakeRuntime(order, poll_error=failure)
+    signals = FakeSignalController(order, (False, False))
+
+    with pytest.raises(RecoveryExhaustedError) as raised:
+        DaemonProcess(
+            runtime,
+            signals=signals,
+            poll_interval=0.25,
+        ).run()
+
+    assert raised.value is failure
+    assert runtime.stop_calls == 1
     assert order == [
         "signals.enter",
         "runtime.start",
