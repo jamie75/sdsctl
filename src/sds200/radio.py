@@ -594,7 +594,12 @@ class SDSScanner:
                 self.endpoint,
                 interval_ms,
             )
-            self._stop_psi_renewal()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise CommandTimeoutError(
+                    "Scanner reconnect timed out stopping PSI renewal."
+                )
+            self._stop_psi_renewal(timeout=remaining)
             self._psi_active = False
             self._psi_interval_ms = None
             self.transport.stop()
@@ -1354,11 +1359,15 @@ class SDSScanner:
         self._psi_renewal_thread = thread
         thread.start()
 
-    def _stop_psi_renewal(self) -> None:
+    def _stop_psi_renewal(self, *, timeout: float | None = None) -> None:
         self._psi_renewal_stop.set()
         thread = self._psi_renewal_thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join()
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise CommandTimeoutError(
+                    "Timed out stopping the PSI renewal thread."
+                )
         self._psi_renewal_thread = None
 
     def start_scanner_info_push(

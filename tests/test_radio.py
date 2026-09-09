@@ -1546,6 +1546,34 @@ def test_reconnect_deadline_includes_active_psi_renewal() -> None:
     radio.close()
 
 
+
+def test_stopping_psi_renewal_has_a_bounded_join() -> None:
+    transport = FakeTransport("udp://scanner")
+    radio = SDS200.from_transport(
+        transport,
+        expected_model="SDS200",
+    )
+    radio.connect()
+
+    release = threading.Event()
+    def blocked_renewal() -> None:
+        release.wait()
+    renewal_thread = threading.Thread(target=blocked_renewal, daemon=True)
+    renewal_thread.start()
+    radio._psi_renewal_thread = renewal_thread
+
+    with pytest.raises(CommandTimeoutError, match="stopping the PSI renewal thread"):
+        radio._stop_psi_renewal(timeout=0.01)
+
+    assert renewal_thread.is_alive()
+    release.set()
+    renewal_thread.join(timeout=1.0)
+    assert not renewal_thread.is_alive()
+
+    radio._psi_renewal_thread = None
+    radio.close()
+
+
 def test_command_timeout_includes_wait_for_command_transaction() -> None:
     transport = FakeTransport()
     radio = SDS200.from_transport(
