@@ -427,6 +427,8 @@ class DaemonRuntime:
         self._inactive_psi_timeout_streak = 0
         self._control_reconnect_failure_streak = 0
         self._process_recovery_requested = False
+        self._recovery_attempt_sequence = 0
+        self._active_recovery_attempt: int | None = None
 
     @property
     def running(self) -> bool:
@@ -713,12 +715,27 @@ class DaemonRuntime:
     def _observe_psi(self, info: ScannerInfo) -> None:
         del info
         with self._state_lock:
+            recovery_attempt = self._active_recovery_attempt
+            previous_timeout_streak = self._inactive_psi_timeout_streak
+            previous_reconnect_failures = (
+                self._control_reconnect_failure_streak
+            )
             self._last_psi_at = self._clock()
             self._inactive_psi_timeout_streak = 0
             self._last_psi_recovery_error = None
             self._last_psi_recovery_action = None
             self._control_reconnect_failure_streak = 0
             self._process_recovery_requested = False
+            self._active_recovery_attempt = None
+        if recovery_attempt is not None:
+            logger.info(
+                "daemon PSI recovery attempt=%d fresh PSI confirmed; "
+                "recovery complete previous_timeout_streak=%d "
+                "previous_reconnect_failure_streak=%d",
+                recovery_attempt,
+                previous_timeout_streak,
+                previous_reconnect_failures,
+            )
 
     def hold_state(
         self,
@@ -939,32 +956,58 @@ class DaemonRuntime:
                 self._psi_ever_established = True
 
     def _escalate_inactive_psi_recovery(self, timeout_streak: int) -> None:
+        with self._state_lock:
+            self._recovery_attempt_sequence += 1
+            attempt = self._recovery_attempt_sequence
+            self._active_recovery_attempt = attempt
+            reconnect_failures = self._control_reconnect_failure_streak
+            psi_active = self.scanner.psi_active
         logger.warning(
             "daemon PSI recovery escalating scanner=%s "
-            "attempting_recovery=control-reconnect timeout_streak=%d/%d",
+            "attempt=%d attempting_recovery=control-reconnect "
+            "timeout_streak=%d/%d reconnect_failure_streak=%d psi_active=%s",
             self.scanner.endpoint,
+            attempt,
             timeout_streak,
             _INACTIVE_PSI_TIMEOUT_ESCALATION_THRESHOLD,
+            reconnect_failures,
+            psi_active,
+        )
+        logger.debug(
+            "daemon PSI recovery attempt=%d runtime reconnect entering",
+            attempt,
         )
         try:
             self.reconnect(timeout=2.0)
         except DaemonControlBusyError:
+            with self._state_lock:
+                self._active_recovery_attempt = None
+            logger.warning(
+                "daemon PSI recovery attempt=%d runtime reconnect skipped: "
+                "daemon control busy resource=control-lock",
+                attempt,
+            )
             return
         except Exception as error:
             completed_at = self._clock()
             with self._state_lock:
+                reconnect_failures_before = (
+                    self._control_reconnect_failure_streak
+                )
                 self._last_psi_recovery_at = completed_at
                 self._last_psi_recovery_error = _redacted_error_type(error)
                 self._last_psi_recovery_action = "control-reconnect"
                 self._control_reconnect_failure_streak += 1
                 reconnect_failures = self._control_reconnect_failure_streak
             logger.warning(
-                "daemon control reconnect attempt %d/%d failed "
-                "scanner=%s error=%s",
-                reconnect_failures,
-                _CONTROL_RECONNECT_FAILURE_BUDGET,
+                "daemon control reconnect attempt=%d failed "
+                "scanner=%s error=%s failure_streak=%d->%d/%d",
+                attempt,
                 self.scanner.endpoint,
                 error.__class__.__name__,
+                reconnect_failures_before,
+                reconnect_failures,
+                _CONTROL_RECONNECT_FAILURE_BUDGET,
             )
             if reconnect_failures >= _CONTROL_RECONNECT_FAILURE_BUDGET:
                 self._request_process_recovery(reconnect_failures)
@@ -974,6 +1017,11 @@ class DaemonRuntime:
                 self._last_psi_recovery_at = completed_at
                 self._last_psi_recovery_action = "control-reconnect"
             logger.info(
+                "daemon PSI recovery attempt=%d runtime reconnect returned "
+                "normally; awaiting fresh PSI",
+                attempt,
+            )
+            logger.debug(
                 "daemon control reconnect escalation completed "
                 "scanner=%s; awaiting fresh PSI confirmation",
                 self.scanner.endpoint,
@@ -1025,20 +1073,54 @@ class DaemonRuntime:
         *,
         timeout: float = 2.0,
     ) -> DaemonControlResult:
+        logger.debug(
+            "daemon runtime reconnect entered timeout=%.3f",
+            timeout,
+        )
+
         def reconnect_with_deadline(remaining: float) -> None:
             if not self.scanner.supports_bounded_reconnect:
                 raise UnsupportedScannerFeatureError(
                     "Daemon reconnect requires a directly owned bounded "
                     "network control transport."
                 )
-            self.scanner.reconnect(timeout=remaining)
+            logger.debug(
+                "daemon runtime reconnect scanner invocation started "
+                "remaining_timeout=%.3f",
+                remaining,
+            )
+            try:
+                self.scanner.reconnect(timeout=remaining)
+            except Exception as error:
+                logger.debug(
+                    "daemon runtime reconnect scanner invocation raised "
+                    "error=%s",
+                    error.__class__.__name__,
+                )
+                raise
+            logger.debug("daemon runtime reconnect scanner invocation returned")
 
-        return self._execute_control(
-            DaemonControlOperation.RECONNECT,
-            timeout,
-            reconnect_with_deadline,
-            requires_connection=False,
-        )
+        try:
+            result = self._execute_control(
+                DaemonControlOperation.RECONNECT,
+                timeout,
+                reconnect_with_deadline,
+                requires_connection=False,
+            )
+        except DaemonControlBusyError:
+            logger.debug(
+                "daemon runtime reconnect skipped before scanner invocation: "
+                "daemon control busy resource=control-lock",
+            )
+            raise
+        except Exception as error:
+            logger.debug(
+                "daemon runtime reconnect raised error=%s",
+                error.__class__.__name__,
+            )
+            raise
+        logger.debug("daemon runtime reconnect returning")
+        return result
 
     def start(self) -> None:
         caught: BaseException | None = None
@@ -1290,6 +1372,10 @@ class DaemonRuntime:
         deadline = monotonic() + normalized_timeout
 
         if not self._control_lock.acquire(blocking=False):
+            logger.debug(
+                "daemon control busy operation=%s resource=control-lock",
+                operation,
+            )
             raise DaemonControlBusyError(
                 "Another daemon scanner control is already in progress."
             )

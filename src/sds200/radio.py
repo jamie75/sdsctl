@@ -594,15 +594,27 @@ class SDSScanner:
                 self.endpoint,
                 interval_ms,
             )
+            logger.debug("scanner reconnect entered endpoint=%s", self.endpoint)
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise CommandTimeoutError(
                     "Scanner reconnect timed out stopping PSI renewal."
                 )
-            self._stop_psi_renewal(timeout=remaining)
+            logger.debug("scanner reconnect stopping PSI renewal")
+            try:
+                self._stop_psi_renewal(timeout=remaining)
+            except Exception as error:
+                logger.debug(
+                    "scanner reconnect PSI renewal stop raised error=%s",
+                    error.__class__.__name__,
+                )
+                raise
+            logger.debug("scanner reconnect PSI renewal stop returned")
             self._psi_active = False
             self._psi_interval_ms = None
+            logger.debug("scanner reconnect stopping control transport")
             self.transport.stop()
+            logger.debug("scanner reconnect control transport stopped")
             self._closed.set()
             try:
                 remaining = deadline - monotonic()
@@ -612,7 +624,9 @@ class SDSScanner:
                         "transport."
                     )
 
+                logger.debug("scanner reconnect starting control transport")
                 self.connect()
+                logger.debug("scanner reconnect control transport started")
 
                 remaining = deadline - monotonic()
                 if remaining <= 0:
@@ -621,10 +635,19 @@ class SDSScanner:
                         "transport."
                     )
                 if interval_ms is not None:
-                    self.start_scanner_info_push(
-                        interval_ms,
-                        timeout=remaining,
-                    )
+                    logger.debug("scanner reconnect starting PSI")
+                    try:
+                        self.start_scanner_info_push(
+                            interval_ms,
+                            timeout=remaining,
+                        )
+                    except Exception as error:
+                        logger.debug(
+                            "scanner reconnect PSI start raised error=%s",
+                            error.__class__.__name__,
+                        )
+                        raise
+                    logger.debug("scanner reconnect PSI start completed")
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise CommandTimeoutError(
@@ -640,6 +663,13 @@ class SDSScanner:
                 self.endpoint,
                 interval_ms,
             )
+            logger.debug("scanner reconnect returning endpoint=%s", self.endpoint)
+        except Exception as error:
+            logger.debug(
+                "scanner reconnect raised error=%s",
+                error.__class__.__name__,
+            )
+            raise
         finally:
             self._command_lock.release()
 

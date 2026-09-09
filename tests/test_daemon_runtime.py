@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -23,6 +24,7 @@ from sds200.daemon_runtime import (
 from sds200.exceptions import (
     CommandRejectedError,
     CommandTimeoutError,
+    DaemonControlBusyError,
     RecoveryExhaustedError,
 )
 from sds200.state import RadioStateSnapshot
@@ -498,7 +500,9 @@ def test_runtime_stale_and_inactive_timeout_failures_share_escalation_streak() -
     runtime.stop()
 
 
-def test_runtime_control_reconnect_success_waits_for_fresh_psi_to_clear_failure() -> None:
+def test_runtime_control_reconnect_success_waits_for_fresh_psi_to_clear_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     now = [100.0]
     order: list[str] = []
     scanner = FakeScanner(order, emit_psi_on_reconnect=False)
@@ -518,6 +522,7 @@ def test_runtime_control_reconnect_success_waits_for_fresh_psi_to_clear_failure(
     scanner._psi_active = False
     scanner.psi_start_failures = 2
 
+    caplog.set_level(logging.DEBUG, logger="sds200.daemon_runtime")
     now[0] = 100.1
     runtime.poll()
     now[0] = 160.2
@@ -528,12 +533,93 @@ def test_runtime_control_reconnect_success_waits_for_fresh_psi_to_clear_failure(
     assert pending.inactive_psi_timeout_streak == 2
     assert pending.last_psi_recovery_error == "CommandTimeoutError"
     assert pending.last_psi_recovery_action == "control-reconnect"
+    assert "attempt=1 runtime reconnect returned normally" in caplog.text
 
     scanner._psi_active = True
     scanner._emit_psi()
     recovered = runtime.snapshot()
     assert recovered.inactive_psi_timeout_streak == 0
     assert recovered.last_psi_recovery_error is None
+    assert "attempt=1 fresh PSI confirmed" in caplog.text
+
+    runtime.stop()
+
+
+def test_runtime_control_reconnect_busy_is_logged_without_failure_increment(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+    now[0] = 100.1
+    runtime.poll()
+
+    def busy_reconnect(*, timeout: float = 2.0) -> None:
+        del timeout
+        raise DaemonControlBusyError("busy")
+
+    monkeypatch.setattr(runtime, "reconnect", busy_reconnect)
+    caplog.set_level(logging.DEBUG, logger="sds200.daemon_runtime")
+    now[0] = 160.2
+    runtime.poll()
+
+    snapshot = runtime.snapshot()
+    assert "attempt=1 runtime reconnect entering" in caplog.text
+    assert "attempt=1 runtime reconnect skipped: daemon control busy" in caplog.text
+    assert snapshot.control_reconnect_failure_streak == 0
+    assert scanner.reconnect_timeouts == []
+
+    runtime.stop()
+
+
+def test_runtime_recovery_attempt_ids_increase_across_escalations(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, reconnect_failures=2)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        psi_recover_after=10.0,
+        psi_recovery_cooldown=60.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    scanner._psi_active = False
+    scanner.psi_start_failures = 2
+    caplog.set_level(logging.DEBUG)
+    now[0] = 100.1
+    runtime.poll()
+    now[0] = 160.2
+    runtime.poll()
+    now[0] = 220.3
+    runtime.poll()
+
+    assert "attempt=1" in caplog.text
+    assert "attempt=2" in caplog.text
+    assert len(scanner.reconnect_timeouts) == 2
 
     runtime.stop()
 
