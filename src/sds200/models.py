@@ -516,7 +516,14 @@ class ScannerInfo:
 
     @property
     def unit_id(self) -> str | None:
-        return self._attribute(("TGID", "ConvFrequency", "SrchFrequency"), "U_Id")
+        for tag in ("UnitID", "TGID", "ConvFrequency", "SrchFrequency"):
+            value = self._attribute((tag,), "U_Id")
+            if value is None:
+                continue
+            if value.casefold() in {"", "none", "uid none"}:
+                continue
+            return value
+        return None
 
     @property
     def volume(self) -> int | None:

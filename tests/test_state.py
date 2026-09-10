@@ -1,3 +1,5 @@
+import pytest
+
 from sds200.state import RadioState, snapshot_from_scanner_info
 from sds200.xml_protocol import ScannerInfoParser
 
@@ -31,6 +33,56 @@ def test_scanner_info_converts_to_shared_snapshot() -> None:
     assert snapshot.signal == 5
     assert snapshot.battery == 2.7
     assert snapshot.recording == "Off"
+
+
+def test_unit_id_reads_sds200_unitid_node_and_reaches_snapshot() -> None:
+    xml = """
+<ScannerInfo Mode="Trunk Scan" V_Screen="trunk_scan">
+<TGID Name="GC PD DISP 1" TGID="TGID:18561" />
+<UnitID Name="UID:729984" U_Id="UID:729984" />
+<Site Name="Gaston Simulcast" />
+<Property P25Status="P25" Mute="Unmute" Rssi="-70" />
+</ScannerInfo>
+"""
+
+    info = ScannerInfoParser().parse("PSI", xml)
+
+    assert info.unit_id == "UID:729984"
+    assert snapshot_from_scanner_info(info).unit_id == "UID:729984"
+
+
+@pytest.mark.parametrize("tag", ["TGID", "ConvFrequency", "SrchFrequency"])
+def test_unit_id_keeps_legacy_node_fallbacks(tag: str) -> None:
+    info = ScannerInfoParser().parse(
+        "PSI",
+        f"<ScannerInfo><{tag} U_Id=\"UID:123456\" /></ScannerInfo>",
+    )
+
+    assert info.unit_id == "UID:123456"
+
+
+def test_unit_id_placeholder_uses_valid_legacy_fallback() -> None:
+    info = ScannerInfoParser().parse(
+        "PSI",
+        """
+<ScannerInfo>
+<UnitID U_Id="UID None" />
+<TGID U_Id="UID:123456" />
+</ScannerInfo>
+""",
+    )
+
+    assert info.unit_id == "UID:123456"
+
+
+@pytest.mark.parametrize("placeholder", ["UID None", "None"])
+def test_unit_id_placeholder_without_fallback_is_unavailable(placeholder: str) -> None:
+    info = ScannerInfoParser().parse(
+        "PSI",
+        f"<ScannerInfo><UnitID U_Id=\"{placeholder}\" /></ScannerInfo>",
+    )
+
+    assert info.unit_id is None
 
 
 def test_state_change_contains_rich_scanner_information() -> None:
