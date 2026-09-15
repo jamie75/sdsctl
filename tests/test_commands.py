@@ -4,6 +4,8 @@ from sds200.commands import (
     INDEXED_MENU_IDS,
     RF_POWER_PLOT_MODULATIONS,
     RF_POWER_PLOT_SAMPLING_RATES,
+    EnterFtpMode,
+    ExitFtpMode,
     GetFavoritesQuickKeys,
     GetGltFavorites,
     GetMsi,
@@ -724,4 +726,42 @@ def test_navigation_acknowledgement() -> None:
     with pytest.raises(CommandRejectedError, match="rejected HLD"):
         command.parse_response(
             Packet(command="HLD", fields=("NG",), raw="HLD,NG")
+        )
+
+
+@pytest.mark.parametrize(
+    ("command_type", "wire", "response_command"),
+    [
+        (EnterFtpMode, "GFM,UNIDEN", "GFM"),
+        (ExitFtpMode, "EFM,UNIDEN", "EFM"),
+    ],
+)
+def test_ftp_mode_commands_require_matching_ok_ack(
+    command_type: type[EnterFtpMode] | type[ExitFtpMode],
+    wire: str,
+    response_command: str,
+) -> None:
+    command = command_type()
+    assert command.wire == wire
+    assert command.response_command == response_command
+    assert command.parse_response(
+        Packet(
+            command=response_command,
+            fields=("OK",),
+            raw=f"{response_command},OK",
+        )
+    ) is None
+
+    with pytest.raises(ProtocolError, match=response_command):
+        command.parse_response(
+            Packet(
+                command=response_command,
+                fields=("NOPE",),
+                raw=f"{response_command},NOPE",
+            )
+        )
+
+    with pytest.raises(ProtocolError, match="unexpected response"):
+        command.parse_response(
+            Packet(command="OTHER", fields=("OK",), raw="OTHER,OK")
         )

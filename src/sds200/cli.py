@@ -2570,6 +2570,13 @@ def build_parser(
     hold_state.add_argument("state", choices=("on", "off"))
     hold_state.add_argument("--timeout", type=_positive_float, default=4.0)
 
+    for action_name, action_help in (
+        ("enter-ftp-mode", "Enter the observed SDS200 FTP programming mode"),
+        ("exit-ftp-mode", "Exit the observed SDS200 FTP programming mode"),
+    ):
+        ftp_mode = subparsers.add_parser(action_name, help=action_help)
+        ftp_mode.add_argument("--timeout", type=_positive_float, default=5.0)
+
     for action_name in ("volume", "squelch"):
         level_control = subparsers.add_parser(
             action_name,
@@ -6397,6 +6404,16 @@ def main(
                         "Scanner squelch did not match the requested level."
                     )
                 print(f"Squelch: {confirmed}")
+                return 0
+
+            if args.action == "enter-ftp-mode":
+                radio.enter_ftp_mode(timeout=args.timeout)
+                print("FTP mode: entered")
+                return 0
+
+            if args.action == "exit-ftp-mode":
+                radio.exit_ftp_mode(timeout=args.timeout)
+                print("FTP mode: exited")
                 return 0
 
             if args.action == "next":

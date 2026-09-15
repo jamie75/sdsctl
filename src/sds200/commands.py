@@ -788,6 +788,38 @@ def _parse_acknowledgement(response: object, command: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class EnterFtpMode:
+    """Enter the observed SDS200 FTP programming mode."""
+
+    @property
+    def wire(self) -> str:
+        return "GFM,UNIDEN"
+
+    @property
+    def response_command(self) -> str:
+        return "GFM"
+
+    def parse_response(self, response: object) -> None:
+        _parse_acknowledgement(response, "GFM")
+
+
+@dataclass(frozen=True, slots=True)
+class ExitFtpMode:
+    """Exit the observed SDS200 FTP programming mode."""
+
+    @property
+    def wire(self) -> str:
+        return "EFM,UNIDEN"
+
+    @property
+    def response_command(self) -> str:
+        return "EFM"
+
+    def parse_response(self, response: object) -> None:
+        _parse_acknowledgement(response, "EFM")
+
+
+@dataclass(frozen=True, slots=True)
 class PressKey:
     """Press one allowlisted SDS hold-related front-panel key."""
 

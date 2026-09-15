@@ -2328,3 +2328,72 @@ def test_radio_waterfall_stop_attempts_both_wires_after_first_failure() -> None:
 
     assert transport.writes == ["GWF,1,OFF", "PWF,1,OFF"]
     radio.close()
+
+@pytest.mark.parametrize(
+    ("method_name", "wire", "ack"),
+    [
+        ("enter_ftp_mode", "GFM,UNIDEN", "GFM,OK"),
+        ("exit_ftp_mode", "EFM,UNIDEN", "EFM,OK"),
+    ],
+)
+def test_ftp_mode_uses_serialized_command_session(
+    method_name: str,
+    wire: str,
+    ack: str,
+) -> None:
+    fake = FakeSerial()
+    radio = SDS200(
+        "/dev/fake",
+        reconnect=False,
+        serial_factory=lambda **kwargs: fake,
+    )
+
+    with radio:
+        def respond() -> None:
+            while fake.writes != [f"{wire}\r".encode()]:
+                time.sleep(0.005)
+            fake.feed(f"{ack}\r".encode())
+
+        thread = threading.Thread(target=respond)
+        thread.start()
+        getattr(radio, method_name)(timeout=1.0)
+        thread.join(timeout=1.0)
+
+    assert fake.writes == [f"{wire}\r".encode()]
+
+
+def test_ftp_mode_timeout_is_reported_without_a_second_transport() -> None:
+    fake = FakeSerial()
+    radio = SDS200(
+        "/dev/fake",
+        reconnect=False,
+        serial_factory=lambda **kwargs: fake,
+    )
+
+    with radio, pytest.raises(CommandTimeoutError, match="GFM response"):
+        radio.enter_ftp_mode(timeout=0.05)
+
+    assert fake.writes == [b"GFM,UNIDEN\r"]
+
+
+def test_ftp_mode_rejection_is_reported() -> None:
+    fake = FakeSerial()
+    radio = SDS200(
+        "/dev/fake",
+        reconnect=False,
+        serial_factory=lambda **kwargs: fake,
+    )
+
+    with radio:
+        def respond() -> None:
+            while fake.writes != [b"EFM,UNIDEN\r"]:
+                time.sleep(0.005)
+            fake.feed(b"EFM,NG\r")
+
+        thread = threading.Thread(target=respond)
+        thread.start()
+        with pytest.raises(CommandRejectedError, match="EFM"):
+            radio.exit_ftp_mode(timeout=1.0)
+        thread.join(timeout=1.0)
+
+    assert fake.writes == [b"EFM,UNIDEN\r"]

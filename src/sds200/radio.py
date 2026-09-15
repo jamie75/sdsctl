@@ -19,6 +19,8 @@ from .analysis_subscriptions import (
 )
 from .commands import (
     Command,
+    EnterFtpMode,
+    ExitFtpMode,
     GetChargeStatus,
     GetFavoritesQuickKeys,
     GetFirmware,
@@ -784,6 +786,34 @@ class SDSScanner:
             timeout,
         )
         return command.parse_response(response)
+
+    def enter_ftp_mode(self, *, timeout: float = 5.0) -> None:
+        """Enter the observed SDS200 FTP programming mode."""
+        logger.info("scanner FTP mode enter requested endpoint=%s", self.endpoint)
+        try:
+            self.execute(EnterFtpMode(), timeout=timeout)
+        except Exception as error:
+            logger.warning(
+                "scanner FTP mode enter failed endpoint=%s error=%s",
+                self.endpoint,
+                error.__class__.__name__,
+            )
+            raise
+        logger.info("scanner FTP mode enter succeeded endpoint=%s", self.endpoint)
+
+    def exit_ftp_mode(self, *, timeout: float = 5.0) -> None:
+        """Exit the observed SDS200 FTP programming mode."""
+        logger.info("scanner FTP mode exit requested endpoint=%s", self.endpoint)
+        try:
+            self.execute(ExitFtpMode(), timeout=timeout)
+        except Exception as error:
+            logger.warning(
+                "scanner FTP mode exit failed endpoint=%s error=%s",
+                self.endpoint,
+                error.__class__.__name__,
+            )
+            raise
+        logger.info("scanner FTP mode exit succeeded endpoint=%s", self.endpoint)
 
     def get_model(self, *, timeout: float = 2.0) -> ScannerModel:
         reported_model = self.execute(GetModel(), timeout=timeout)

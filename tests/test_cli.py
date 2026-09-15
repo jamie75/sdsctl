@@ -471,3 +471,10 @@ def test_runtime_parser_preserves_explicit_no_color_alias() -> None:
     ).parse_args(["--no-color", "info"])
 
     assert args.color == "never"
+
+@pytest.mark.parametrize("action", ["enter-ftp-mode", "exit-ftp-mode"])
+def test_ftp_mode_actions_parse_with_safe_default_timeout(action: str) -> None:
+    args = cli.build_parser().parse_args([action])
+
+    assert args.action == action
+    assert args.timeout == 5.0
