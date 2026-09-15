@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import logging
 import os
@@ -171,6 +172,11 @@ from .exceptions import (
     DaemonDisconnectedError,
     DaemonProtocolError,
     SDS200Error,
+)
+from .ftp_write_test import (
+    FTP_WRITE_TEST_DEFAULT_PORT,
+    FTP_WRITE_TEST_DEFAULT_TIMEOUT,
+    run_ftp_write_test,
 )
 from .home_assistant_live_audio import (
     LiveAudioEncoderPipeline,
@@ -2576,6 +2582,36 @@ def build_parser(
     ):
         ftp_mode = subparsers.add_parser(action_name, help=action_help)
         ftp_mode.add_argument("--timeout", type=_positive_float, default=5.0)
+
+    ftp_validation = subparsers.add_parser(
+        "ftp-write-test",
+        help="Validate a disposable SDS200 FTP file round trip",
+    )
+    ftp_validation.add_argument(
+        "--ftp-username",
+        default="uniden",
+        metavar="USERNAME",
+        help="FTP username (default: uniden)",
+    )
+    ftp_validation.add_argument(
+        "--ftp-port",
+        type=_remote_port,
+        default=FTP_WRITE_TEST_DEFAULT_PORT,
+        metavar="PORT",
+    )
+    ftp_validation.add_argument(
+        "--ftp-timeout",
+        type=_positive_float,
+        default=FTP_WRITE_TEST_DEFAULT_TIMEOUT,
+        metavar="SECONDS",
+    )
+    ftp_validation.add_argument(
+        "--scanner-timeout",
+        type=_positive_float,
+        default=5.0,
+        metavar="SECONDS",
+        help="FTP-mode command timeout (default: 5.0)",
+    )
 
     for action_name in ("volume", "squelch"):
         level_control = subparsers.add_parser(
@@ -6415,6 +6451,29 @@ def main(
                 radio.exit_ftp_mode(timeout=args.timeout)
                 print("FTP mode: exited")
                 return 0
+
+            if args.action == "ftp-write-test":
+                if args.host is None:
+                    raise ValueError(
+                        "ftp-write-test requires --host for an SDS200"
+                    )
+                password = getpass.getpass("FTP password: ")
+                result = run_ftp_write_test(
+                    radio,
+                    host=args.host,
+                    username=args.ftp_username,
+                    password=password,
+                    port=args.ftp_port,
+                    timeout=args.ftp_timeout,
+                    scanner_timeout=args.scanner_timeout,
+                )
+                for stage in result.stages:
+                    stage_status = "PASS" if stage.succeeded else "FAIL"
+                    detail = f" ({stage.detail})" if stage.detail else ""
+                    print(f"{stage_status}: {stage.name}{detail}")
+                outcome = "passed" if result.succeeded else "failed"
+                print(f"FTP write validation: {outcome}")
+                return 0 if result.succeeded else 2
 
             if args.action == "next":
                 radio.next(
