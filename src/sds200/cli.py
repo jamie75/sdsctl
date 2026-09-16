@@ -173,6 +173,11 @@ from .exceptions import (
     DaemonProtocolError,
     SDS200Error,
 )
+from .favorites_backup import (
+    FAVORITES_BACKUP_DEFAULT_FTP_PORT,
+    FAVORITES_BACKUP_DEFAULT_FTP_TIMEOUT,
+    backup_favorites,
+)
 from .ftp_write_test import (
     FTP_WRITE_TEST_DEFAULT_PORT,
     FTP_WRITE_TEST_DEFAULT_TIMEOUT,
@@ -2611,6 +2616,30 @@ def build_parser(
         default=5.0,
         metavar="SECONDS",
         help="FTP-mode command timeout (default: 5.0)",
+    )
+
+    favorites_backup = subparsers.add_parser(
+        "favorites-backup",
+        help="Create a read-only SDS200 Favorites FTP backup",
+    )
+    favorites_backup.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="DIRECTORY",
+        help="Local directory under which the timestamped backup is created",
+    )
+    favorites_backup.add_argument(
+        "--ftp-port",
+        type=_remote_port,
+        default=FAVORITES_BACKUP_DEFAULT_FTP_PORT,
+        metavar="PORT",
+    )
+    favorites_backup.add_argument(
+        "--ftp-timeout",
+        type=_positive_float,
+        default=FAVORITES_BACKUP_DEFAULT_FTP_TIMEOUT,
+        metavar="SECONDS",
     )
 
     for action_name in ("volume", "squelch"):
@@ -6324,6 +6353,35 @@ def main(
                 configuration_paths=configuration_paths,
                 environ=environ,
             )
+
+        if args.action == "favorites-backup":
+            if args.host is None:
+                raise ValueError(
+                    "favorites-backup requires --host for an SDS200"
+                )
+            backup_result = backup_favorites(
+                args.host,
+                args.output,
+                requested_model=args.model or "SDS200",
+                port=args.ftp_port,
+                timeout=args.ftp_timeout,
+            )
+            print("FTP: anonymous passive read-only session")
+            print(f"Retrieved f_list.cfg ({len(backup_result.inventory.catalog_bytes)} bytes)")
+            print(f"Favorites Lists: {len(backup_result.inventory.lists)}")
+            for document in backup_result.inventory.documents:
+                print(
+                    f"Retrieved {document.filename} "
+                    f"({len(document.content)} bytes)"
+                )
+            print(f"Backup directory: {backup_result.directory}")
+            print(f"Manifest: {backup_result.manifest_path}")
+            if backup_result.inventory.warnings:
+                print(f"Warnings: {len(backup_result.inventory.warnings)}")
+            if backup_result.inventory.errors:
+                print(f"Errors: {len(backup_result.inventory.errors)}")
+            print("Favorites backup: complete")
+            return 0
 
         if args.action == "asterisk-moh":
             return _run_asterisk_moh(args)
