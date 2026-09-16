@@ -543,6 +543,7 @@ from .favorites_editing import (
     delete_favorites_record,
     rename_favorites_record,
     select_favorites_record_target,
+    set_tgid_avoid,
 )
 from .favorites_editor import (
     FavoritesCopiedTreeEditorStorage,
@@ -2171,6 +2172,7 @@ __all__ = [
     "execute_favorites_copied_tree_write",
     "preflight_favorites_copied_tree_write",
     "plan_recording_retention",
+    "set_tgid_avoid",
     "rename_favorites_record",
     "present_radio_state",
     "present_scanner_info",

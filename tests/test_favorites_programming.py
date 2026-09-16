@@ -189,3 +189,104 @@ def test_cli_prepare_does_not_require_scanner_host() -> None:
     )
     assert args.action == "favorites-prepare"
     assert args.host is None
+
+
+def _avoid_edit(
+    old: str = "Off", new: str = "On"
+) -> FavoritesProgrammingPlan:
+    return FavoritesProgrammingPlan(
+        (
+            FavoritesProgrammingEdit(
+                favorites_list="Synthetic Favorites",
+                filename="f_000001.hpd",
+                record_index=14,
+                record_type="TGID",
+                field="avoid",
+                expected_old_value=old,
+                new_value=new,
+            ),
+        )
+    )
+
+
+def test_tgid_avoid_edit_reports_one_lossless_field_change(tmp_path: Path) -> None:
+    source_dir = _backup(tmp_path / "backup")
+    source = load_programming_source(source_dir)
+    candidate = generate_candidate_image(
+        source, tmp_path / "out", _avoid_edit(), now=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+
+    assert candidate.validation.files_changed == ("f_000001.hpd",)
+    assert candidate.validation.changed_record_count == 1
+    assert candidate.validation.changed_field_count == 1
+    change = candidate.validation.field_changes[0]
+    assert (change.filename, change.record_index, change.record_type, change.field) == (
+        "f_000001.hpd",
+        14,
+        "TGID",
+        "avoid",
+    )
+    assert (change.old_value, change.new_value) == ("Off", "On")
+    assert (candidate.directory / "f_list.cfg").read_bytes() == CATALOG
+    assert json.loads(candidate.changes_path.read_text())["edits"][0]["field"] == "avoid"
+
+
+@pytest.mark.parametrize(("old", "new"), (("Off", "On"), ("On", "Off")))
+def test_tgid_avoid_edit_supports_both_persistent_values(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    hpd = HPD.replace(
+        b"TGID\t\t\tSynthetic Dispatch\tOff\t",
+        f"TGID\t\t\tSynthetic Dispatch\t{old}\t".encode(),
+    )
+    source = load_programming_source(_backup(tmp_path / "backup", hpd=hpd))
+    candidate = generate_candidate_image(
+        source, tmp_path / "out", _avoid_edit(old, new), now=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    records = parse_favorites_file((candidate.directory / "f_000001.hpd").read_bytes()).records
+    assert records[14].fields[3] == new
+
+
+def test_tgid_avoid_edit_preserves_everything_except_target_field(tmp_path: Path) -> None:
+    source_dir = _backup(tmp_path / "backup")
+    source = load_programming_source(source_dir)
+    candidate = generate_candidate_image(
+        source, tmp_path / "out", _avoid_edit(), now=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    before = parse_favorites_file(HPD).records
+    after = parse_favorites_file((candidate.directory / "f_000001.hpd").read_bytes()).records
+    assert len(before) == len(after)
+    assert all(before[index] == after[index] for index in range(len(before)) if index != 14)
+    assert before[14].fields[:3] == after[14].fields[:3]
+    assert before[14].fields[4:] == after[14].fields[4:]
+    assert before[14].line_ending == after[14].line_ending
+    assert (candidate.directory / "f_000001.hpd").read_bytes().count(b"\r\n") == HPD.count(b"\r\n")
+
+
+def test_tgid_avoid_edit_rejects_stale_and_noop_targets(tmp_path: Path) -> None:
+    source = load_programming_source(_backup(tmp_path / "backup"))
+    with pytest.raises(FavoritesProgrammingError, match="stale"):
+        generate_candidate_image(
+            source, tmp_path / "stale", _avoid_edit(old="On"), now=datetime(2026, 1, 2, tzinfo=UTC)
+        )
+    with pytest.raises(FavoritesProgrammingError, match="does not change"):
+        generate_candidate_image(
+            source,
+            tmp_path / "noop",
+            _avoid_edit(old="Off", new="Off"),
+            now=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(("expected", "new"), (("Maybe", "On"), ("Off", "Maybe")))
+def test_tgid_avoid_edit_rejects_unsupported_values(
+    tmp_path: Path, expected: str, new: str
+) -> None:
+    with pytest.raises(FavoritesProgrammingError, match="Avoid values"):
+        _avoid_edit(expected, new)
+
+
+def test_programming_plan_rejects_duplicate_avoid_target() -> None:
+    edit = _avoid_edit().edits[0]
+    with pytest.raises(FavoritesProgrammingError, match="duplicate"):
+        FavoritesProgrammingPlan(edits=(edit, edit))

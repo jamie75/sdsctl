@@ -113,6 +113,9 @@ _NAME_FIELD_INDEX = {
     "TGID": 2,
 }
 
+_TGID_AVOID_FIELD_INDEX = 3
+_TGID_AVOID_VALUES = frozenset({"Off", "On"})
+
 _DELETABLE_HPD_COMMANDS = frozenset(
     {
         "C-Freq",
@@ -724,6 +727,38 @@ def create_favorites_record_after(
     return intended
 
 
+def set_tgid_avoid(
+    snapshot: FavoritesStorageSnapshot,
+    target: FavoritesRecordTarget,
+    value: str,
+) -> FavoritesStorageSnapshot:
+    """Replace the persistent Avoid value on one exact TGID record."""
+
+    if target.source_kind is not FavoritesRecordSourceKind.HPD:
+        raise FavoritesRecordEditError(
+            "TGID Avoid editing requires an HPD record target."
+        )
+    if target.record.command != "TGID":
+        raise FavoritesRecordEditError(
+            "TGID Avoid editing requires a TGID record."
+        )
+    if value not in _TGID_AVOID_VALUES:
+        raise FavoritesRecordEditError(
+            "TGID Avoid value must be 'Off' or 'On'."
+        )
+    if len(target.record.fields) <= _TGID_AVOID_FIELD_INDEX:
+        raise FavoritesRecordEditError(
+            "TGID record does not contain its Avoid field."
+        )
+
+    return _replace_favorites_record_field(
+        snapshot,
+        target,
+        _TGID_AVOID_FIELD_INDEX,
+        value,
+    )
+
+
 __all__ = [
     "FavoritesRecordEditError",
     "FavoritesRecordSourceKind",
@@ -731,5 +766,6 @@ __all__ = [
     "create_favorites_record_after",
     "delete_favorites_record",
     "rename_favorites_record",
+    "set_tgid_avoid",
     "select_favorites_record_target",
 ]

@@ -18,6 +18,7 @@ from .favorites_editing import (
     FavoritesRecordEditError,
     rename_favorites_record,
     select_favorites_record_target,
+    set_tgid_avoid,
 )
 from .favorites_file import FavoritesSourceFile, parse_favorites_file
 from .favorites_schema import FavoritesSchemaSeverity, validate_favorites_workspace
@@ -34,6 +35,8 @@ PROGRAMMING_CHANGES_SCHEMA_VERSION = 1
 _BACKUP_SCHEMA = "sdsctl.favorites-backup"
 _CATALOG_FILENAME = "f_list.cfg"
 _NAME_FIELD_INDEX = 2
+_AVOID_FIELD_INDEX = 3
+_SUPPORTED_FIELDS = frozenset({"name", "avoid"})
 
 
 class FavoritesProgrammingError(ValueError):
@@ -89,7 +92,7 @@ def _metadata_value(source: FavoritesSourceFile, command: str) -> str | None:
 
 @dataclass(frozen=True, slots=True)
 class FavoritesProgrammingEdit:
-    """One stale-protected semantic TGID name rename."""
+    """One stale-protected semantic TGID name or Avoid edit."""
 
     favorites_list: str
     filename: str
@@ -112,8 +115,13 @@ class FavoritesProgrammingEdit:
             raise FavoritesProgrammingError("Favorites edit text fields must be non-empty strings")
         if type(self.record_index) is not int or self.record_index < 0:
             raise FavoritesProgrammingError("Favorites edit record_index must be non-negative")
-        if self.record_type != "TGID" or self.field != "name":
-            raise FavoritesProgrammingError("only TGID name edits are supported")
+        if self.record_type != "TGID" or self.field not in _SUPPORTED_FIELDS:
+            raise FavoritesProgrammingError("only TGID name or Avoid edits are supported")
+        if self.field == "avoid" and (
+            self.expected_old_value not in {"Off", "On"}
+            or self.new_value not in {"Off", "On"}
+        ):
+            raise FavoritesProgrammingError("TGID Avoid values must be 'Off' or 'On'")
         _safe_filename(self.filename)
 
 
@@ -362,11 +370,12 @@ def _apply_plan(
         if edit.record_index >= len(source_file.records):
             raise FavoritesProgrammingError(f"record index out of range: {edit.record_index}")
         record = source_file.records[edit.record_index]
-        if record.command != edit.record_type or len(record.fields) <= _NAME_FIELD_INDEX:
+        field_index = _NAME_FIELD_INDEX if edit.field == "name" else _AVOID_FIELD_INDEX
+        if record.command != edit.record_type or len(record.fields) <= field_index:
             raise FavoritesProgrammingError(
                 f"record target mismatch at {edit.filename}[{edit.record_index}]"
             )
-        if record.fields[_NAME_FIELD_INDEX] != edit.expected_old_value:
+        if record.fields[field_index] != edit.expected_old_value:
             raise FavoritesProgrammingError(
                 f"stale edit target at {edit.filename}[{edit.record_index}]"
             )
@@ -376,13 +385,18 @@ def _apply_plan(
             target = select_favorites_record_target(
                 snapshot, edit.record_index, document_index=document_index
             )
-            snapshot = rename_favorites_record(snapshot, target, edit.new_value)
+            if edit.field == "name":
+                snapshot = rename_favorites_record(snapshot, target, edit.new_value)
+            else:
+                snapshot = set_tgid_avoid(snapshot, target, edit.new_value)
         except (FavoritesRecordEditError, TypeError, ValueError) as error:
             raise FavoritesProgrammingError(str(error)) from None
     return snapshot
 
 
-def _field_label(index: int) -> str:
+def _field_label(record_type: str, index: int) -> str:
+    if record_type == "TGID" and index == _AVOID_FIELD_INDEX:
+        return "avoid"
     return "name" if index == _NAME_FIELD_INDEX else f"field_{index}"
 
 
@@ -414,7 +428,12 @@ def _record_differences(
             for field_index, (before, after) in enumerate(zip(old.fields, new.fields, strict=True)):
                 if before != after:
                     change = FavoritesProgrammingFieldChange(
-                        filename, index, old.command, _field_label(field_index), before, after
+                        filename,
+                        index,
+                        old.command,
+                        _field_label(old.command, field_index),
+                        before,
+                        after,
                     )
                     changed.append(change)
                     fields.append(change)

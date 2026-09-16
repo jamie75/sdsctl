@@ -280,6 +280,28 @@ Credentials, provider content, scanner programming values, confirmation tokens,
 provenance, operation identities, artifacts, private paths, and private-derived
 hashes remain untracked.
 
+## SDS200 TGID Avoid physical validation
+
+On September 16, 2026, the separate SDS200 Favorites programming transaction was
+validated against a physical SDS200 using Favorites List "lake_hill",
+"f_000001.hpd", record index 103, TGID "51985", and name "HOTEL 3 TEST". The
+semantic change was the persistent TGID field "Avoid: Off -> On".
+
+The transaction entered GFM, authenticated with the configured writable FTP
+credential, wrote only the candidate HPD, retrieved it for exact verification,
+and exited FTP mode successfully. The candidate HPD SHA-256 was
+"2ae8e463983bad2cebf4bad1d94b76f2eaa6996529a324ea223d30a5a1cb8ade"; an
+independent anonymous FTP readback matched that SHA-256 and showed
+"Avoid=On" while preserving "TGID=51985" and "HOTEL 3 TEST". No unrelated
+semantic fields changed.
+
+During the observation period, other scanner traffic continued while the
+avoided TGID was no longer presented. Immediately after EFM, the physical
+scanner exhibited a short, observed command/PSI settling interval before
+reliable daemon startup. This is an operational observation, not a documented
+fixed SDS200 timing guarantee: callers should allow the scanner to settle and
+verify model, firmware, and PSI readiness before declaring restoration complete.
+
 ## Deliberate limits
 
 The editor does not expose arbitrary positional fields, hierarchy or catalog
