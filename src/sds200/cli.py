@@ -183,6 +183,13 @@ from .favorites_programming import (
     generate_candidate_image,
     load_edit_plan,
     load_programming_source,
+    validate_candidate_image,
+)
+from .favorites_upload import (
+    FAVORITES_UPLOAD_DEFAULT_SCANNER_TIMEOUT,
+    execute_favorites_programming,
+    prepare_favorites_programming,
+    run_favorites_programming,
 )
 from .ftp_write_test import (
     FTP_WRITE_TEST_DEFAULT_PORT,
@@ -2671,6 +2678,61 @@ def build_parser(
         type=Path,
         metavar="JSON",
         help="Optional JSON file containing stale-protected local edits",
+    )
+
+    favorites_program = subparsers.add_parser(
+        "favorites-program",
+        help="Preflight or program a validated SDS200 Favorites image",
+    )
+    favorites_program.add_argument(
+        "--candidate",
+        type=Path,
+        required=True,
+        metavar="DIRECTORY",
+        help="Validated local Favorites programming image",
+    )
+    favorites_program.add_argument(
+        "--safety-backup-output",
+        type=Path,
+        required=True,
+        metavar="DIRECTORY",
+        help="Local directory for the mandatory fresh scanner backup",
+    )
+    favorites_program.add_argument(
+        "--ftp-username",
+        default="uniden",
+        metavar="USERNAME",
+        help="Writable FTP username (used only with --execute)",
+    )
+    favorites_program.add_argument(
+        "--ftp-port",
+        type=_remote_port,
+        default=FAVORITES_BACKUP_DEFAULT_FTP_PORT,
+        metavar="PORT",
+    )
+    favorites_program.add_argument(
+        "--ftp-timeout",
+        type=_positive_float,
+        default=FAVORITES_BACKUP_DEFAULT_FTP_TIMEOUT,
+        metavar="SECONDS",
+    )
+    favorites_program.add_argument(
+        "--scanner-timeout",
+        type=_positive_float,
+        default=FAVORITES_UPLOAD_DEFAULT_SCANNER_TIMEOUT,
+        metavar="SECONDS",
+        help="GFM/EFM command timeout (default: 5.0)",
+    )
+    favorites_program_mode = favorites_program.add_mutually_exclusive_group()
+    favorites_program_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and compare only; this is the default",
+    )
+    favorites_program_mode.add_argument(
+        "--execute",
+        action="store_true",
+        help="Explicitly allow validated HPD writes after preflight",
     )
 
     for action_name in ("volume", "squelch"):
@@ -6429,6 +6491,72 @@ def main(
             print(f"Changed fields: {candidate.validation.changed_field_count}")
             print(f"Changes manifest: {candidate.changes_path}")
             return 0
+
+        if args.action == "favorites-program":
+            if args.host is None:
+                raise ValueError("favorites-program requires --host for an SDS200")
+            if args.execute:
+                preflight = prepare_favorites_programming(
+                    args.candidate,
+                    host=args.host,
+                    safety_backup_output=args.safety_backup_output,
+                    ftp_port=args.ftp_port,
+                    ftp_timeout=args.ftp_timeout,
+                )
+                password = getpass.getpass("FTP password: ")
+                with selected_radio(args) as radio:
+                    program_result = execute_favorites_programming(
+                        preflight,
+                        radio,
+                        username=args.ftp_username,
+                        password=password,
+                        ftp_port=args.ftp_port,
+                        ftp_timeout=args.ftp_timeout,
+                        scanner_timeout=args.scanner_timeout,
+                    )
+            else:
+                program_result = run_favorites_programming(
+                    args.candidate,
+                    host=args.host,
+                    safety_backup_output=args.safety_backup_output,
+                    ftp_port=args.ftp_port,
+                    ftp_timeout=args.ftp_timeout,
+                )
+            outcome = "success" if program_result.success else "failed"
+            print(f"SDS200 Favorites programming: {outcome}")
+            print(f"Mode: {'execute' if not program_result.dry_run else 'dry-run'}")
+            print(f"Candidate: {program_result.candidate_directory}")
+            print(f"Source backup: {program_result.source_backup_directory}")
+            print(f"Safety backup: {program_result.fresh_safety_backup_path}")
+            print(f"Receipt: {program_result.receipt_path}")
+            print(f"GFM entered: {'yes' if program_result.gfm_entered else 'no'}")
+            print(f"FTP authenticated: {'yes' if program_result.ftp_authenticated else 'no'}")
+            efm_status = (
+                "succeeded"
+                if program_result.efm_succeeded
+                else "not attempted or failed"
+            )
+            print(f"EFM: {efm_status}")
+            print("Files:")
+            source = load_programming_source(program_result.source_backup_directory)
+            validation = validate_candidate_image(source, program_result.candidate_directory)
+            for change in validation.field_changes:
+                print(
+                    f"  {change.filename}[{change.record_index}] "
+                    f"{change.field}: {change.old_value!r} -> {change.new_value!r}"
+                )
+            for file_result in program_result.file_results:
+                retrieved = file_result.retrieved_sha256 or "not retrieved"
+                print(
+                    f"  {file_result.filename}: {file_result.status}; "
+                    f"old={file_result.prewrite_sha256}; "
+                    f"new={file_result.expected_sha256}; retrieved={retrieved}"
+                )
+            if program_result.primary_error:
+                print(f"Primary error: {program_result.primary_error}", file=sys.stderr)
+            for error in program_result.cleanup_errors:
+                print(f"Cleanup error: {error}", file=sys.stderr)
+            return 0 if program_result.success else 2
 
         if args.action == "asterisk-moh":
             return _run_asterisk_moh(args)
