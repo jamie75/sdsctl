@@ -178,6 +178,12 @@ from .favorites_backup import (
     FAVORITES_BACKUP_DEFAULT_FTP_TIMEOUT,
     backup_favorites,
 )
+from .favorites_programming import (
+    FavoritesProgrammingPlan,
+    generate_candidate_image,
+    load_edit_plan,
+    load_programming_source,
+)
 from .ftp_write_test import (
     FTP_WRITE_TEST_DEFAULT_PORT,
     FTP_WRITE_TEST_DEFAULT_TIMEOUT,
@@ -2640,6 +2646,31 @@ def build_parser(
         type=_positive_float,
         default=FAVORITES_BACKUP_DEFAULT_FTP_TIMEOUT,
         metavar="SECONDS",
+    )
+
+    favorites_prepare = subparsers.add_parser(
+        "favorites-prepare",
+        help="Prepare a local SDS200 Favorites programming image",
+    )
+    favorites_prepare.add_argument(
+        "--backup",
+        type=Path,
+        required=True,
+        metavar="DIRECTORY",
+        help="Existing local read-only Favorites backup",
+    )
+    favorites_prepare.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="DIRECTORY",
+        help="Output directory for the new candidate image",
+    )
+    favorites_prepare.add_argument(
+        "--edit-plan",
+        type=Path,
+        metavar="JSON",
+        help="Optional JSON file containing stale-protected local edits",
     )
 
     for action_name in ("volume", "squelch"):
@@ -6381,6 +6412,22 @@ def main(
             if backup_result.inventory.errors:
                 print(f"Errors: {len(backup_result.inventory.errors)}")
             print("Favorites backup: complete")
+            return 0
+
+        if args.action == "favorites-prepare":
+            source = load_programming_source(args.backup)
+            if args.edit_plan:
+                plan = load_edit_plan(args.edit_plan)
+            else:
+                plan = FavoritesProgrammingPlan.empty()
+            candidate = generate_candidate_image(source, args.output, plan)
+            print("Local Favorites programming image: complete")
+            print(f"Source backup: {source.backup_directory}")
+            print(f"Candidate directory: {candidate.directory}")
+            print(f"Changed files: {candidate.validation.changed_file_count}")
+            print(f"Changed records: {candidate.validation.changed_record_count}")
+            print(f"Changed fields: {candidate.validation.changed_field_count}")
+            print(f"Changes manifest: {candidate.changes_path}")
             return 0
 
         if args.action == "asterisk-moh":
