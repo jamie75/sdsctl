@@ -53,6 +53,9 @@ class AudioDatagramSocketLike(Protocol):
 
 
 class RtspSessionClientLike(Protocol):
+    @property
+    def session(self) -> str | None: ...
+
     def start(self, client_port: int) -> RtpTransportInfo: ...
 
     def get_parameter(self) -> object: ...
@@ -402,17 +405,42 @@ class NetworkAudioTransport:
             negotiated = rtsp_client.start(client_port)
         except (OSError, RtspProtocolError, ScannerConnectionError) as exc:
             if rtsp_client is not None:
+                session_established = bool(
+                    getattr(exc, "session_established", False)
+                    or getattr(rtsp_client, "session", None) is not None
+                )
+                if session_established:
+                    with suppress(Exception):
+                        rtsp_client.teardown()
+                        with self._statistics_lock:
+                            self._statistics.teardowns_sent += 1
                 with suppress(Exception):
                     rtsp_client.close()
             if rtp_socket is not None:
                 with suppress(OSError):
                     rtp_socket.close()
+            error_detail = str(exc).strip() or exc.__class__.__name__
+            stage = getattr(exc, "stage", "unknown")
+            session_state = getattr(
+                exc,
+                "session_established",
+                session_established if rtsp_client is not None else False,
+            )
+            logger.error(
+                "SDS200 network audio start failed endpoint=%s stage=%s "
+                "session_established=%s detail=%s",
+                self.endpoint,
+                stage,
+                "yes" if session_state else "no",
+                error_detail,
+            )
             with self._state_lock:
                 self._handler = None
                 self._audio_recovery_state = "failed"
-                self._last_audio_recovery_error = exc.__class__.__name__
+                self._last_audio_recovery_error = error_detail
             raise ScannerConnectionError(
-                f"Could not start SDS200 network audio at {self.endpoint}."
+                f"Could not start SDS200 network audio at {self.endpoint}: "
+                f"{error_detail}"
             ) from exc
 
         assert rtp_socket is not None

@@ -34,6 +34,38 @@ class RtspStatusError(RtspProtocolError):
         super().__init__(f"RTSP {method} failed with {status_code} {reason}.")
 
 
+def _startup_error_detail(error: BaseException) -> str:
+    if isinstance(error, RtspStatusError):
+        return f"status={error.status_code} reason={error.reason or 'unknown'}"
+    detail = str(error).strip()
+    if detail:
+        return f"error={detail}"
+    return f"error_type={error.__class__.__name__}"
+
+
+class RtspStartupError(ScannerConnectionError):
+    """A failure annotated with the RTSP startup stage and session state."""
+
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        stage: str,
+        session_established: bool,
+        cause: BaseException,
+    ) -> None:
+        self.endpoint = endpoint
+        self.stage = stage
+        self.session_established = session_established
+        self.cause_type = cause.__class__.__name__
+        super().__init__(
+            "RTSP startup failed "
+            f"stage={stage} endpoint={endpoint} "
+            f"session_established={'yes' if session_established else 'no'} "
+            f"cause_type={self.cause_type} {_startup_error_detail(cause)}"
+        )
+
+
 class StreamSocketLike(Protocol):
     def settimeout(self, value: float | None) -> None: ...
 
@@ -288,11 +320,24 @@ class RtspClient:
     def start(self, client_port: int) -> RtpTransportInfo:
         if not 1 <= client_port <= 65535:
             raise ValueError("RTP client port must be between 1 and 65535.")
-        self.connect()
-        self.options()
-        self.describe()
-        self.setup(client_port)
-        self.play()
+        for stage, operation in (
+            ("connect", lambda: self.connect()),
+            ("OPTIONS", self.options),
+            ("DESCRIBE", self.describe),
+            ("SETUP", lambda: self.setup(client_port)),
+            ("PLAY", self.play),
+        ):
+            try:
+                operation()
+            except RtspStartupError:
+                raise
+            except Exception as error:
+                raise RtspStartupError(
+                    endpoint=self.endpoint,
+                    stage=stage,
+                    session_established=self._session is not None,
+                    cause=error,
+                ) from error
         assert self._transport is not None
         return self._transport
 

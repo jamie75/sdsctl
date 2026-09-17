@@ -11,6 +11,7 @@ from sds200.rtsp import (
     DEFAULT_RTSP_MAX_RESPONSE_HEADER_BYTES,
     RtspClient,
     RtspProtocolError,
+    RtspStartupError,
     RtspStatusError,
     parse_rtp_transport,
     parse_sdp_audio,
@@ -313,6 +314,44 @@ def test_non_success_response_raises_status_error() -> None:
 
     with pytest.raises(RtspStatusError, match="400 Bad Request"):
         client.options()
+
+
+def test_rtsp_start_reports_play_stage_and_established_session() -> None:
+    sdp = b"v=0\r\nm=audio 0 RTP/AVP 0\r\na=control:trackID=1\r\n"
+    stream = FakeStreamSocket(
+        [
+            response(1),
+            response(
+                2,
+                headers={
+                    "Content-Type": "application/sdp",
+                    "Content-Base": "rtsp://192.0.2.25/au:scanner.au/",
+                },
+                body=sdp,
+            ),
+            response(
+                3,
+                headers={
+                    "Session": "30026000",
+                    "Transport": (
+                        "RTP/AVP;unicast;client_port=48607;"
+                        "source=192.0.2.25;server_port=56002"
+                    ),
+                },
+            ),
+            response(4, status="454 Session Not Found"),
+        ]
+    )
+    client = make_client(stream)
+
+    with pytest.raises(RtspStartupError, match="stage=PLAY") as captured:
+        client.start(48607)
+
+    error = captured.value
+    assert error.stage == "PLAY"
+    assert error.session_established
+    assert error.cause_type == "RtspStatusError"
+    assert "status=454 reason=Session Not Found" in str(error)
 
 
 def test_parse_sdp_requires_pcmu_audio_track() -> None:

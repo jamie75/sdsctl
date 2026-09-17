@@ -8,6 +8,7 @@ from collections.abc import Callable
 import pytest
 
 from sds200.audio import AudioChunk
+from sds200.exceptions import ScannerConnectionError
 from sds200.network_audio import NetworkAudioTransport
 from sds200.pcmu import PcmuPacket
 from sds200.rtsp import RtpTransportInfo
@@ -62,9 +63,11 @@ class FakeRtspClient:
         self.keepalives = 0
         self.teardowns = 0
         self.closed = False
+        self.session: str | None = None
 
     def start(self, client_port: int) -> RtpTransportInfo:
         self.started_ports.append(client_port)
+        self.session = "fake-session"
         return RtpTransportInfo(
             source="192.0.2.25",
             server_port=56002,
@@ -77,6 +80,7 @@ class FakeRtspClient:
 
     def teardown(self) -> object:
         self.teardowns += 1
+        self.session = None
         return object()
 
     def close(self) -> None:
@@ -424,6 +428,80 @@ class RecoveryRtspClient(FakeRtspClient):
         if self.fail_keepalive:
             raise OSError("simulated RTSP keepalive failure")
         return super().get_parameter()
+
+
+class SessionThenStartFailureClient(FakeRtspClient):
+    def start(self, client_port: int) -> RtpTransportInfo:
+        del client_port
+        self.session = "partial-session"
+        raise OSError("simulated failure after RTSP session establishment")
+
+
+class SessionThenCleanupFailureClient(SessionThenStartFailureClient):
+    def teardown(self) -> object:
+        self.teardowns += 1
+        raise OSError("simulated TEARDOWN failure")
+
+
+def test_network_audio_does_not_teardown_before_rtsp_session() -> None:
+    datagram = FakeAudioDatagramSocket()
+    rtsp = RecoveryRtspClient(fail_start=True)
+    transport = NetworkAudioTransport(
+        "192.0.2.25",
+        datagram_socket_factory=lambda _family, _type: datagram,
+        rtsp_client_factory=lambda _host, _port, _path, _timeout: rtsp,
+        local_address_resolver=lambda _host, _port: "192.0.2.10",
+    )
+
+    with pytest.raises(ScannerConnectionError, match="Could not start SDS200 network audio"):
+        transport.start(lambda _chunk: None)
+
+    assert rtsp.teardowns == 0
+    assert rtsp.closed
+    assert datagram.closed
+    assert transport.statistics.teardowns_sent == 0
+
+
+def test_network_audio_tears_down_partial_rtsp_session_before_close() -> None:
+    datagram = FakeAudioDatagramSocket()
+    rtsp = SessionThenStartFailureClient()
+    transport = NetworkAudioTransport(
+        "192.0.2.25",
+        datagram_socket_factory=lambda _family, _type: datagram,
+        rtsp_client_factory=lambda _host, _port, _path, _timeout: rtsp,
+        local_address_resolver=lambda _host, _port: "192.0.2.10",
+    )
+
+    with pytest.raises(ScannerConnectionError, match="Could not start SDS200 network audio"):
+        transport.start(lambda _chunk: None)
+
+    assert rtsp.teardowns == 1
+    assert rtsp.closed
+    assert datagram.closed
+    assert transport.statistics.teardowns_sent == 1
+
+
+def test_network_audio_cleanup_failure_does_not_mask_start_failure() -> None:
+    datagram = FakeAudioDatagramSocket()
+    rtsp = SessionThenCleanupFailureClient()
+    transport = NetworkAudioTransport(
+        "192.0.2.25",
+        datagram_socket_factory=lambda _family, _type: datagram,
+        rtsp_client_factory=lambda _host, _port, _path, _timeout: rtsp,
+        local_address_resolver=lambda _host, _port: "192.0.2.10",
+    )
+
+    with pytest.raises(
+        ScannerConnectionError,
+        match="simulated failure after RTSP session establishment",
+    ) as captured:
+        transport.start(lambda _chunk: None)
+
+    assert "TEARDOWN failure" not in str(captured.value)
+    assert rtsp.teardowns == 1
+    assert rtsp.closed
+    assert datagram.closed
+    assert transport.statistics.teardowns_sent == 0
 
 
 def test_network_audio_recovers_after_keepalive_failure_without_losing_handler() -> None:
