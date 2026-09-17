@@ -466,6 +466,42 @@ For rollback, stop the service, restore the previously installed package and
 backed-up configuration, then restart and repeat the same health checks. Do not
 move or reuse a published version tag.
 
+## External ProScan maintenance recovery
+
+An external ProScan session that takes control of the SDS200 is a maintenance
+event. It is not a supported concurrent control session for the daemon. The
+daemon keeps its existing bounded PSI recovery diagnostics, but does not attempt
+additional automatic reconnect or daemon-restart state-machine recovery for
+this condition.
+
+After ProScan releases the scanner, use the following supported recovery
+procedure:
+
+```bash
+sudo systemctl restart sdsctl.service
+```
+
+Then verify all of the following before returning the scanner to normal use:
+
+1. `sdsctl.service` is active and running.
+2. The daemon status reports PSI active.
+3. The RTP packet count is advancing.
+4. The daemon-owned PCMU consumers are connected.
+
+For a local daemon deployment, the status and health checks can be made through
+the daemon socket without opening the scanner from a second client:
+
+```bash
+sdsctl daemon-client --socket-path /tmp/sds200-daemon.sock status
+sdsctl daemon-client --socket-path /tmp/sds200-daemon.sock health
+```
+
+Use the deployment's configured socket path when it differs from the example.
+Do not issue raw scanner commands or perform another manual reconnect as part of
+this recovery procedure. If PSI or RTP does not return after the service
+restart, leave the dependent services alone and investigate the daemon and
+scanner state as a separate maintenance event.
+
 ## Security and operational limits
 
 The SDS200 network protocols are unauthenticated and unencrypted. Keep scanner
