@@ -125,6 +125,51 @@ def test_backup_writes_exact_files_hashes_and_manifest_atomically(
     assert not list(tmp_path.glob(".*.tmp-*"))
 
 
+def test_backup_uses_human_readable_suffix_when_timestamp_directory_exists(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "sds200-favorites-20260915T190000Z"
+    existing.mkdir()
+    sentinel = existing / "keep-me.txt"
+    sentinel.write_text("existing backup", encoding="utf-8")
+    ftp = FakeFtp({"f_list.cfg": CATALOG, "f_000001.hpd": HPD})
+
+    result = backup_favorites(
+        "192.0.2.5",
+        tmp_path,
+        ftp_factory=_factory(ftp),
+        now=datetime(2026, 9, 15, 19, 0, tzinfo=UTC),
+    )
+
+    assert result.directory == tmp_path / "sds200-favorites-20260915T190000Z-01"
+    assert sentinel.read_text(encoding="utf-8") == "existing backup"
+    assert (result.directory / "f_000001.hpd").read_bytes() == HPD
+    assert not list(tmp_path.glob(".*.tmp-*"))
+
+
+def test_consecutive_backups_with_same_timestamp_get_distinct_paths(
+    tmp_path: Path,
+) -> None:
+    timestamp = datetime(2026, 9, 15, 19, 0, tzinfo=UTC)
+    first = backup_favorites(
+        "192.0.2.5",
+        tmp_path,
+        ftp_factory=_factory(FakeFtp({"f_list.cfg": CATALOG, "f_000001.hpd": HPD})),
+        now=timestamp,
+    )
+    second = backup_favorites(
+        "192.0.2.5",
+        tmp_path,
+        ftp_factory=_factory(FakeFtp({"f_list.cfg": CATALOG, "f_000001.hpd": HPD})),
+        now=timestamp,
+    )
+
+    assert first.directory.name == "sds200-favorites-20260915T190000Z"
+    assert second.directory.name == "sds200-favorites-20260915T190000Z-01"
+    assert (first.directory / "f_000001.hpd").read_bytes() == HPD
+    assert (second.directory / "f_000001.hpd").read_bytes() == HPD
+
+
 def test_duplicate_reference_is_warned_and_document_retrieved_once() -> None:
     catalog = CATALOG.replace(
         b"UnknownRecord\tkeep\tthis\n",

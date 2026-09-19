@@ -503,14 +503,9 @@ def backup_favorites(
     stamp = (datetime.now(UTC) if now is None else now.astimezone(UTC)).strftime(
         "%Y%m%dT%H%M%SZ"
     )
-    final_directory = output_directory / f"sds200-favorites-{stamp}"
-    if final_directory.exists():
-        raise FavoritesBackupError(
-            "local",
-            f"backup directory already exists: {final_directory.name}",
-        )
+    base_name = f"sds200-favorites-{stamp}"
     staging_directory = output_directory / (
-        f".{final_directory.name}.tmp-{uuid.uuid4().hex}"
+        f".{base_name}.tmp-{uuid.uuid4().hex}"
     )
     staging_directory.mkdir()
     try:
@@ -518,12 +513,19 @@ def backup_favorites(
         for document in inventory.documents:
             _atomic_write(staging_directory / document.filename, document.content)
         _atomic_write(staging_directory / "manifest.json", _manifest(inventory))
-        if final_directory.exists():
-            raise FavoritesBackupError(
-                "local",
-                f"backup directory already exists: {final_directory.name}",
-            )
-        staging_directory.rename(final_directory)
+        suffix = 0
+        while True:
+            directory_name = base_name if suffix == 0 else f"{base_name}-{suffix:02d}"
+            final_directory = output_directory / directory_name
+            if final_directory.exists():
+                suffix += 1
+                continue
+            try:
+                staging_directory.rename(final_directory)
+            except FileExistsError:
+                suffix += 1
+                continue
+            break
     except BaseException:
         shutil.rmtree(staging_directory, ignore_errors=True)
         raise
