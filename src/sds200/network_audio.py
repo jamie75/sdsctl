@@ -38,6 +38,7 @@ MAX_RTP_DATAGRAM_SIZE = 65535
 DEFAULT_RTP_INACTIVITY_TIMEOUT = 60.0
 DEFAULT_AUDIO_RECOVERY_ATTEMPTS = 3
 DEFAULT_AUDIO_RECOVERY_BACKOFF = 1.0
+DEFAULT_FIRST_RTP_TIMEOUT = 5.0
 
 
 class AudioDatagramSocketLike(Protocol):
@@ -188,6 +189,7 @@ class NetworkAudioTransport:
         inactivity_timeout: float = DEFAULT_RTP_INACTIVITY_TIMEOUT,
         recovery_attempts: int = DEFAULT_AUDIO_RECOVERY_ATTEMPTS,
         recovery_backoff: float = DEFAULT_AUDIO_RECOVERY_BACKOFF,
+        first_rtp_timeout: float = DEFAULT_FIRST_RTP_TIMEOUT,
         datagram_socket_factory: AudioDatagramSocketFactory = (
             default_audio_datagram_socket_factory
         ),
@@ -218,6 +220,8 @@ class NetworkAudioTransport:
             raise ValueError("Audio recovery attempts must be a positive integer.")
         if recovery_backoff <= 0:
             raise ValueError("Audio recovery backoff must be greater than zero.")
+        if first_rtp_timeout <= 0:
+            raise ValueError("First RTP timeout must be greater than zero.")
 
         self.host = host
         self.rtsp_port = rtsp_port
@@ -230,6 +234,7 @@ class NetworkAudioTransport:
         self.inactivity_timeout = inactivity_timeout
         self.recovery_attempts = recovery_attempts
         self.recovery_backoff = recovery_backoff
+        self.first_rtp_timeout = first_rtp_timeout
         self._datagram_socket_factory = datagram_socket_factory
         self._rtsp_client_factory = rtsp_client_factory
         self._local_address_resolver = local_address_resolver
@@ -253,6 +258,7 @@ class NetworkAudioTransport:
         self._rtp_watchdog_started_monotonic: float | None = None
         self._rtp_packet_seen_this_session = False
         self._rtp_ever_received = False
+        self._first_rtp_event = threading.Event()
         self._last_keepalive_monotonic: float | None = None
         self._audio_recovery_state = "stopped"
         self._audio_recovery_count = 0
@@ -349,6 +355,19 @@ class NetworkAudioTransport:
         with self._lifecycle_lock:
             self._start_session(handler, reset_statistics=True)
 
+    def wait_for_first_rtp(self, *, timeout: float | None = None) -> None:
+        wait_timeout = self.first_rtp_timeout if timeout is None else timeout
+        if wait_timeout <= 0:
+            raise ValueError("First RTP timeout must be greater than zero.")
+        if self._first_rtp_event.wait(wait_timeout):
+            return
+        with self._state_lock:
+            self._audio_recovery_state = "failed"
+            self._last_audio_recovery_error = "FirstRtpTimeout"
+        raise ScannerConnectionError(
+            "Timed out waiting for the first accepted SDS200 RTP packet."
+        )
+
     def _start_session(
         self,
         handler: AudioChunkHandler,
@@ -369,6 +388,7 @@ class NetworkAudioTransport:
                 monotonic() if not reset_statistics and self._rtp_ever_received else None
             )
             self._rtp_packet_seen_this_session = False
+            self._first_rtp_event.clear()
             self._last_keepalive_monotonic = None
             self._audio_recovery_state = "starting"
             if reset_statistics:
@@ -466,7 +486,7 @@ class NetworkAudioTransport:
             )
             receiver = self._receiver_thread
             keepalive = self._keepalive_thread
-            self._audio_recovery_state = "healthy"
+            self._audio_recovery_state = "starting"
         assert receiver is not None
         assert keepalive is not None
         receiver.start()
@@ -620,6 +640,8 @@ class NetworkAudioTransport:
                 self._rtp_watchdog_started_monotonic = None
                 self._rtp_packet_seen_this_session = True
                 self._rtp_ever_received = True
+                self._audio_recovery_state = "healthy"
+                self._first_rtp_event.set()
 
             observed_at = datetime.now(UTC)
             self.events.emit(
@@ -741,8 +763,11 @@ class NetworkAudioTransport:
                         if self._stop.is_set():
                             self._finish_audio_recovery()
                             return
+                        wait_for_first_rtp = self._rtp_ever_received
                         self.stop()
                         self._start_session(handler, reset_statistics=False)
+                        if wait_for_first_rtp:
+                            self.wait_for_first_rtp()
                     self._finish_audio_recovery()
                     logger.info(
                         "SDS200 network audio recovery completed endpoint=%s "

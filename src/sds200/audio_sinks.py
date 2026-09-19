@@ -704,6 +704,31 @@ class AudioFanoutSession:
             ",".join(self._sink_names),
         )
 
+    def stop_stream(self) -> None:
+        """Stop only the underlying transport, preserving fanout workers."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if not self._started or self._stopped:
+                    return
+            self.stream.stop()
+            snapshot = self.lifecycle_snapshot()
+        self.events.emit("state", snapshot)
+
+    def start_stream(self) -> None:
+        """Start only the underlying transport, preserving fanout workers."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if not self._started or self._stopped:
+                    raise RuntimeError("Audio fanout session is not restartable.")
+            self.stream.start()
+            snapshot = self.lifecycle_snapshot()
+        self.events.emit("state", snapshot)
+
+    def wait_for_first_rtp(self, *, timeout: float) -> None:
+        waiter = getattr(self.stream.transport, "wait_for_first_rtp", None)
+        if callable(waiter):
+            waiter(timeout=timeout)
+
     def stop(self) -> None:
         with self._lifecycle_lock:
             with self._state_lock:

@@ -964,6 +964,13 @@ def build_parser(
         help="RTSP GET_PARAMETER interval (default: 15.0)",
     )
     daemon.add_argument(
+        "--first-rtp-timeout",
+        type=_positive_float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Timeout waiting for first RTP during reacquisition (default: 5.0)",
+    )
+    daemon.add_argument(
         "--destination-config",
         type=Path,
         metavar="PATH",
@@ -3562,6 +3569,7 @@ def _run_daemon(
             local_port=args.rtp_bind_port,
             rtsp_timeout=args.rtsp_timeout,
             keepalive_interval=args.keepalive_interval,
+            first_rtp_timeout=args.first_rtp_timeout,
         )
         audio_transport = network_transport
     audio = AudioFanoutSession(AudioStream(audio_transport), (router,))
@@ -3577,6 +3585,7 @@ def _run_daemon(
         ),
         psi_recover_after=args.psi_recover_after,
         psi_recovery_cooldown=args.psi_recovery_cooldown,
+        audio_startup_timeout=args.first_rtp_timeout,
     )
     recording_manager: DaemonRecordingManager | None = None
     recording_file_server: DaemonRecordingFileServer | None = None

@@ -25,7 +25,6 @@ from sds200.exceptions import (
     CommandRejectedError,
     CommandTimeoutError,
     DaemonControlBusyError,
-    RecoveryExhaustedError,
 )
 from sds200.state import RadioStateSnapshot
 from sds200.waterfall_session import WaterfallSessionState
@@ -227,6 +226,25 @@ class TrackingAudioTransport(FakeAudioTransport):
         super().stop()
         if self.fail_stop:
             raise RuntimeError("secret audio shutdown detail")
+
+
+class ReacquisitionAudioTransport(TrackingAudioTransport):
+    def __init__(self, order: list[str]) -> None:
+        super().__init__(order)
+        self.first_rtp_available = False
+        self.fail_next_start = False
+
+    def start(self, handler: AudioChunkHandler) -> None:
+        if self.fail_next_start:
+            self.order.append("audio.start")
+            self.fail_next_start = False
+            raise RuntimeError("RTSP unavailable")
+        super().start(handler)
+
+    def wait_for_first_rtp(self, *, timeout: float) -> None:
+        del timeout
+        if not self.first_rtp_available:
+            raise CommandTimeoutError("first RTP unavailable")
 
 
 class TrackingRouter(PcmSinkRouter):
@@ -566,7 +584,8 @@ def test_runtime_control_reconnect_success_waits_for_fresh_psi_to_clear_failure(
     assert pending.inactive_psi_timeout_streak == 2
     assert pending.last_psi_recovery_error == "CommandTimeoutError"
     assert pending.last_psi_recovery_action == "control-reconnect"
-    assert "attempt=1 runtime reconnect returned normally" in caplog.text
+    assert "attempt=1 runtime reconnect returned normally" not in caplog.text
+    assert pending.recovery_mode == "fast-recovery"
 
     scanner._psi_active = True
     scanner._emit_psi()
@@ -685,20 +704,106 @@ def test_runtime_exits_after_three_failed_control_reconnect_escalations(
     runtime.poll()
     now[0] = 220.3
     runtime.poll()
-    with pytest.raises(RecoveryExhaustedError):
-        now[0] = 280.4
-        runtime.poll()
+    now[0] = 280.4
+    runtime.poll()
 
     snapshot = runtime.snapshot()
     assert len(scanner.reconnect_timeouts) == 3
     assert snapshot.control_reconnect_failure_streak == 3
-    assert snapshot.process_recovery_requested is True
+    assert snapshot.process_recovery_requested is False
+    assert snapshot.recovery_mode == "backoff"
+    assert snapshot.next_reacquire_seconds == pytest.approx(10.0)
     assert order.count("audio.start") == 1
     assert "audio.stop" not in order
 
-    runtime._request_process_recovery(3)  # type: ignore[attr-defined]
-    runtime._request_process_recovery(3)  # type: ignore[attr-defined]
-    assert caplog.text.count("requesting process restart") == 1
+    now[0] = 290.5
+    runtime.poll()
+    recovered = runtime.snapshot()
+    assert recovered.recovery_mode == "healthy"
+    assert recovered.reacquire_attempt == 0
+    assert recovered.last_reacquire_error is None
+    assert recovered.next_reacquire_seconds is None
+    assert order.count("audio.start") == 2
+    assert order.count("audio.stop") == 1
+
+    runtime.stop()
+
+
+def test_runtime_reacquisition_retries_after_first_rtp_failure() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = ReacquisitionAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        reacquire_initial_delay=1.0,
+        reacquire_max_delay=2.0,
+        audio_startup_timeout=0.1,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    runtime._enter_reacquisition("test outage")  # type: ignore[attr-defined]
+    now[0] = 101.1
+    runtime.poll()
+
+    failed = runtime.snapshot()
+    assert failed.recovery_mode == "backoff"
+    assert failed.last_reacquire_error == "CommandTimeoutError"
+    assert failed.next_reacquire_seconds == pytest.approx(2.0)
+    assert order.count("audio.start") == 2
+    assert order.count("audio.stop") == 2
+
+    transport.first_rtp_available = True
+    now[0] = 103.3
+    runtime.poll()
+    recovered = runtime.snapshot()
+    assert recovered.recovery_mode == "healthy"
+    assert recovered.last_reacquire_error is None
+    assert recovered.reacquire_attempt == 0
+    assert recovered.audio.running
+
+    runtime.stop()
+
+
+def test_runtime_reacquisition_retries_after_rtsp_start_failure() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = ReacquisitionAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        reacquire_initial_delay=1.0,
+        reacquire_max_delay=2.0,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    transport.first_rtp_available = True
+    transport.fail_next_start = True
+    runtime._enter_reacquisition("test RTSP outage")  # type: ignore[attr-defined]
+    now[0] = 101.1
+    runtime.poll()
+
+    failed = runtime.snapshot()
+    assert failed.recovery_mode == "backoff"
+    assert failed.last_reacquire_error == "RuntimeError"
+    assert failed.scanner_connected is False
+
+    now[0] = 103.3
+    runtime.poll()
+    recovered = runtime.snapshot()
+    assert recovered.recovery_mode == "healthy"
+    assert recovered.scanner_connected is True
+    assert recovered.audio.running
 
     runtime.stop()
 
@@ -1487,3 +1592,112 @@ def test_runtime_transition_listener_failure_is_isolated() -> None:
         DaemonRuntimeState.STOPPING,
         DaemonRuntimeState.STOPPED,
     ]
+class BlockingReacquisitionAudioTransport(ReacquisitionAudioTransport):
+    def __init__(self, order: list[str]) -> None:
+        super().__init__(order)
+        self.wait_started = threading.Event()
+        self.release_wait = threading.Event()
+
+    def wait_for_first_rtp(self, *, timeout: float) -> None:
+        del timeout
+        self.wait_started.set()
+        self.release_wait.wait(timeout=1.0)
+        super().wait_for_first_rtp(timeout=0.0)
+
+
+def test_runtime_reacquisition_keeps_reacquiring_until_first_rtp() -> None:
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = BlockingReacquisitionAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(scanner, audio, router, audio_startup_timeout=0.1)
+
+    runtime.start()
+    runtime._enter_reacquisition("test outage")  # type: ignore[attr-defined]
+    runtime._next_reacquire_at = 0.0  # type: ignore[attr-defined]
+    worker = threading.Thread(target=runtime.poll)
+    worker.start()
+    assert transport.wait_started.wait(timeout=1.0)
+    assert runtime.snapshot().recovery_mode == "reacquiring"
+
+    transport.first_rtp_available = True
+    transport.release_wait.set()
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert runtime.snapshot().recovery_mode == "healthy"
+
+    runtime.stop()
+
+
+def test_runtime_reacquisition_backoff_caps_and_resets() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = ReacquisitionAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        audio_startup_timeout=0.1,
+        clock=lambda: now[0],
+    )
+
+    runtime.start()
+    runtime._enter_reacquisition("test outage")  # type: ignore[attr-defined]
+    scheduled: list[float] = []
+    for _ in range(6):
+        remaining = runtime.snapshot().next_reacquire_seconds
+        assert remaining is not None
+        scheduled.append(remaining)
+        now[0] += remaining + 0.1
+        runtime.poll()
+
+    assert scheduled == pytest.approx([10.0, 20.0, 40.0, 60.0, 60.0, 60.0])
+    assert runtime.snapshot().reacquire_attempt == 6
+    assert runtime.snapshot().recovery_mode == "backoff"
+
+    transport.first_rtp_available = True
+    remaining = runtime.snapshot().next_reacquire_seconds
+    assert remaining is not None
+    now[0] += remaining + 0.1
+    runtime.poll()
+    assert runtime.snapshot().recovery_mode == "healthy"
+    assert runtime.snapshot().reacquire_attempt == 0
+
+    runtime._enter_reacquisition("second outage")  # type: ignore[attr-defined]
+    assert runtime.snapshot().next_reacquire_seconds == pytest.approx(10.0)
+    runtime.stop()
+
+
+def test_runtime_shutdown_waits_for_bounded_reacquisition_without_retrying() -> None:
+    order: list[str] = []
+    scanner = FakeScanner(order)
+    transport = BlockingReacquisitionAudioTransport(order)
+    transport.first_rtp_available = True
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(scanner, audio, router)
+
+    runtime.start()
+    runtime._enter_reacquisition("test outage")  # type: ignore[attr-defined]
+    runtime._next_reacquire_at = 0.0  # type: ignore[attr-defined]
+    poller = threading.Thread(target=runtime.poll)
+    poller.start()
+    assert transport.wait_started.wait(timeout=1.0)
+
+    stopper = threading.Thread(target=runtime.stop)
+    stopper.start()
+    time.sleep(0.01)
+    transport.release_wait.set()
+    poller.join(timeout=1.0)
+    stopper.join(timeout=1.0)
+
+    assert not poller.is_alive()
+    assert not stopper.is_alive()
+    assert runtime.snapshot().state is DaemonRuntimeState.STOPPED
+    starts = order.count("audio.start")
+    runtime.poll()
+    assert order.count("audio.start") == starts

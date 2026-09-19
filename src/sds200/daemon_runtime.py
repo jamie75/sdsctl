@@ -24,7 +24,6 @@ from .exceptions import (
     CommandTimeoutError,
     DaemonControlBusyError,
     DaemonControlUnavailableError,
-    RecoveryExhaustedError,
     UnsupportedScannerFeatureError,
 )
 from .models import ScannerInfo
@@ -223,6 +222,11 @@ class DaemonRuntimeSnapshot:
     inactive_psi_timeout_streak: int = 0
     control_reconnect_failure_streak: int = 0
     process_recovery_requested: bool = False
+    recovery_mode: str = "healthy"
+    reacquire_attempt: int = 0
+    next_reacquire_seconds: float | None = None
+    last_reacquire_error: str | None = None
+    last_reacquire_at: datetime | None = None
 
     @property
     def active(self) -> bool:
@@ -270,6 +274,15 @@ class DaemonRuntimeSnapshot:
                 self.control_reconnect_failure_streak
             ),
             "process_recovery_requested": self.process_recovery_requested,
+            "recovery_mode": self.recovery_mode,
+            "reacquire_attempt": self.reacquire_attempt,
+            "next_reacquire_seconds": self.next_reacquire_seconds,
+            "last_reacquire_error": self.last_reacquire_error,
+            "last_reacquire_at": (
+                self.last_reacquire_at.isoformat()
+                if self.last_reacquire_at is not None
+                else None
+            ),
         }
 
 
@@ -363,6 +376,9 @@ class DaemonRuntime:
         allow_degraded_psi_startup: bool = False,
         psi_recover_after: float = 10.0,
         psi_recovery_cooldown: float = 60.0,
+        audio_startup_timeout: float = 5.0,
+        reacquire_initial_delay: float = 10.0,
+        reacquire_max_delay: float = 60.0,
         clock: Callable[[], float] = monotonic,
         now: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -384,6 +400,14 @@ class DaemonRuntime:
             raise ValueError(
                 "PSI recovery cooldown must not be negative."
             )
+        if audio_startup_timeout <= 0:
+            raise ValueError("Audio startup timeout must be greater than zero.")
+        if reacquire_initial_delay <= 0:
+            raise ValueError("Reacquisition initial delay must be greater than zero.")
+        if reacquire_max_delay < reacquire_initial_delay:
+            raise ValueError(
+                "Reacquisition maximum delay must not be less than its initial delay."
+            )
         if not any(sink is router for sink in audio.sinks):
             raise ValueError(
                 "Daemon runtime audio fanout must include its PCM sink router."
@@ -399,6 +423,9 @@ class DaemonRuntime:
         self.allow_degraded_psi_startup = allow_degraded_psi_startup
         self.psi_recover_after = float(psi_recover_after)
         self.psi_recovery_cooldown = float(psi_recovery_cooldown)
+        self._audio_startup_timeout = float(audio_startup_timeout)
+        self._reacquire_initial_delay = float(reacquire_initial_delay)
+        self._reacquire_max_delay = float(reacquire_max_delay)
         self._clock = clock
         self._now = now
         self._scanner_model: str | None = None
@@ -422,6 +449,7 @@ class DaemonRuntime:
         self._last_error: str | None = None
         self._psi_unsubscribe: Callable[[], None] | None = None
         self._last_psi_at: float | None = None
+        self._psi_observed_event = threading.Event()
         self._last_psi_recovery_at: float | None = None
         self._psi_ever_established = False
         self._last_psi_recovery_error: str | None = None
@@ -431,6 +459,13 @@ class DaemonRuntime:
         self._process_recovery_requested = False
         self._recovery_attempt_sequence = 0
         self._active_recovery_attempt: int | None = None
+        self._recovery_mode = "healthy"
+        self._reacquire_attempt = 0
+        self._reacquire_delay = self._reacquire_initial_delay
+        self._next_reacquire_at: float | None = None
+        self._last_reacquire_error: str | None = None
+        self._last_reacquire_at: datetime | None = None
+        self._scanner_disconnected_at: float | None = None
 
     @property
     def running(self) -> bool:
@@ -463,16 +498,43 @@ class DaemonRuntime:
 
         observed_at = self._clock()
         with self._state_lock:
-            if (
-                self._state is not DaemonRuntimeState.RUNNING
-                or not self.scanner.connected
-            ):
+            if self._state is not DaemonRuntimeState.RUNNING:
                 return
             psi_active = self.scanner.psi_active
             last_psi_at = self._last_psi_at
             last_recovery_at = self._last_psi_recovery_at
             psi_ever_established = self._psi_ever_established
             timeout_streak = self._inactive_psi_timeout_streak
+
+        with self._state_lock:
+            recovery_mode = self._recovery_mode
+            next_reacquire_at = self._next_reacquire_at
+            scanner_connected = self.scanner.connected
+            audio_failed = (
+                self.audio.lifecycle_snapshot().audio_recovery_state == "failed"
+            )
+        if recovery_mode == "backoff":
+            if next_reacquire_at is None or observed_at >= next_reacquire_at:
+                self._attempt_reacquisition()
+            return
+        if not scanner_connected:
+            with self._state_lock:
+                if self._scanner_disconnected_at is None:
+                    self._scanner_disconnected_at = observed_at
+                disconnected_for = (
+                    observed_at - self._scanner_disconnected_at
+                )
+            if (
+                psi_ever_established
+                and disconnected_for >= self.psi_recover_after
+            ):
+                self._enter_reacquisition("scanner control disconnected")
+            return
+        with self._state_lock:
+            self._scanner_disconnected_at = None
+        if audio_failed and psi_ever_established:
+            self._enter_reacquisition("audio transport recovery failed")
+            return
 
         if not psi_active:
             if not self.allow_degraded_psi_startup and not psi_ever_established:
@@ -723,12 +785,25 @@ class DaemonRuntime:
                 self._control_reconnect_failure_streak
             )
             self._last_psi_at = self._clock()
+            self._psi_ever_established = True
             self._inactive_psi_timeout_streak = 0
             self._last_psi_recovery_error = None
             self._last_psi_recovery_action = None
             self._control_reconnect_failure_streak = 0
             self._process_recovery_requested = False
             self._active_recovery_attempt = None
+            # Fresh PSI is necessary for full reacquisition, but it is not
+            # sufficient: the new audio session must also accept RTP before
+            # recovery is considered complete. Fast recovery modes may still
+            # complete on a fresh PSI frame as before.
+            if self._recovery_mode not in {"reacquiring", "backoff", "healthy"}:
+                self._recovery_mode = "healthy"
+                self._reacquire_attempt = 0
+                self._reacquire_delay = self._reacquire_initial_delay
+                self._next_reacquire_at = None
+                self._last_reacquire_error = None
+                self._last_reacquire_at = None
+        self._psi_observed_event.set()
         if recovery_attempt is not None:
             logger.info(
                 "daemon PSI recovery attempt=%d fresh PSI confirmed; "
@@ -964,6 +1039,8 @@ class DaemonRuntime:
             self._active_recovery_attempt = attempt
             reconnect_failures = self._control_reconnect_failure_streak
             psi_active = self.scanner.psi_active
+            before_psi_at = self._last_psi_at
+            self._recovery_mode = "fast-recovery"
         logger.warning(
             "daemon PSI recovery escalating scanner=%s "
             "attempt=%d attempting_recovery=control-reconnect "
@@ -981,6 +1058,10 @@ class DaemonRuntime:
         )
         try:
             self.reconnect(timeout=2.0)
+            with self._state_lock:
+                fresh_psi = self._last_psi_at != before_psi_at
+            if not fresh_psi:
+                raise CommandTimeoutError("Control reconnect produced no fresh PSI.")
         except DaemonControlBusyError:
             with self._state_lock:
                 self._active_recovery_attempt = None
@@ -1012,7 +1093,7 @@ class DaemonRuntime:
                 _CONTROL_RECONNECT_FAILURE_BUDGET,
             )
             if reconnect_failures >= _CONTROL_RECONNECT_FAILURE_BUDGET:
-                self._request_process_recovery(reconnect_failures)
+                self._enter_reacquisition("bounded control recovery exhausted", error)
         else:
             completed_at = self._clock()
             with self._state_lock:
@@ -1030,24 +1111,131 @@ class DaemonRuntime:
             )
 
     def _request_process_recovery(self, reconnect_failures: int) -> None:
+        self._enter_reacquisition("bounded control recovery exhausted")
+
+    def _enter_reacquisition(
+        self,
+        reason: str,
+        error: BaseException | None = None,
+    ) -> None:
+        now = self._clock()
         with self._state_lock:
-            if self._process_recovery_requested:
+            if self._recovery_mode in {"backoff", "reacquiring"}:
                 return
-            self._process_recovery_requested = True
-        logger.critical(
-            "daemon recovery exhausted scanner=%s psi_active=%s "
-            "timeout_streak=%d control_reconnect_failures=%d/%d; "
-            "requesting process restart via controlled non-zero exit",
+            self._recovery_mode = "backoff"
+            retry_delay = self._reacquire_delay
+            self._next_reacquire_at = now + retry_delay
+            self._reacquire_delay = min(retry_delay * 2, self._reacquire_max_delay)
+            self._last_reacquire_error = (
+                _redacted_error_type(error) if error is not None else reason
+            )
+            self._last_psi_recovery_error = self._last_reacquire_error
+            self._last_psi_recovery_action = "reacquire"
+            self._process_recovery_requested = False
+        logger.warning(
+            "daemon entering scanner reacquisition mode scanner=%s "
+            "retry_in=%.1fs reason=%s",
             self.scanner.endpoint,
-            self.scanner.psi_active,
-            self._inactive_psi_timeout_streak,
-            reconnect_failures,
-            _CONTROL_RECONNECT_FAILURE_BUDGET,
+            retry_delay,
+            reason,
         )
-        raise RecoveryExhaustedError(
-            "Daemon scanner recovery exhausted after "
-            f"{reconnect_failures} control reconnect failures."
-        )
+
+    def _attempt_reacquisition(self) -> None:
+        if not self._control_lock.acquire(blocking=False):
+            return
+        try:
+            with self._lifecycle_lock:
+                with self._state_lock:
+                    self._recovery_mode = "reacquiring"
+                    self._reacquire_attempt += 1
+                    attempt = self._reacquire_attempt
+                    self._next_reacquire_at = None
+                    self._last_reacquire_at = _require_aware_datetime(
+                        self._now()
+                    )
+                    self._psi_observed_event.clear()
+
+                primary_error: BaseException | None = None
+                cleanup_failures: list[BaseException] = []
+                try:
+                    self.audio.stop_stream()
+                    self.scanner.close()
+                    self.scanner.connect()
+                    self._probe_scanner_identity()
+                    self.scanner.start_scanner_info_push(
+                        self.psi_interval_ms,
+                        timeout=self.psi_timeout,
+                    )
+                    if not self._psi_observed_event.wait(self.psi_timeout):
+                        raise CommandTimeoutError(
+                            "Scanner reacquisition produced no fresh PSI."
+                        )
+                    self.audio.start_stream()
+                    self.audio.wait_for_first_rtp(
+                        timeout=self._audio_startup_timeout
+                    )
+                except BaseException as error:
+                    primary_error = error
+                    self._cleanup_step(
+                        "audio stream",
+                        self.audio.stop_stream,
+                        cleanup_failures,
+                    )
+                    self._cleanup_step(
+                        "scanner control",
+                        self.scanner.close,
+                        cleanup_failures,
+                    )
+
+                if primary_error is not None:
+                    with self._state_lock:
+                        self._recovery_mode = "backoff"
+                        self._last_reacquire_error = _redacted_error_type(
+                            primary_error
+                        )
+                        self._last_psi_recovery_error = (
+                            self._last_reacquire_error
+                        )
+                        self._last_psi_recovery_action = "reacquire"
+                        retry_delay = self._reacquire_delay
+                        self._next_reacquire_at = (
+                            self._clock() + retry_delay
+                        )
+                        self._reacquire_delay = min(
+                            retry_delay * 2,
+                            self._reacquire_max_delay,
+                        )
+                    logger.warning(
+                        "daemon scanner reacquisition attempt=%d failed "
+                        "scanner=%s error=%s cleanup_failures=%d "
+                        "retry_in=%.1fs",
+                        attempt,
+                        self.scanner.endpoint,
+                        primary_error.__class__.__name__,
+                        len(cleanup_failures),
+                        retry_delay,
+                    )
+                    return
+
+                with self._state_lock:
+                    self._recovery_mode = "healthy"
+                    self._reacquire_attempt = 0
+                    self._reacquire_delay = self._reacquire_initial_delay
+                    self._next_reacquire_at = None
+                    self._last_reacquire_error = None
+                    self._last_psi_recovery_error = None
+                    self._last_psi_recovery_action = None
+                    self._inactive_psi_timeout_streak = 0
+                    self._control_reconnect_failure_streak = 0
+                    self._process_recovery_requested = False
+                logger.info(
+                    "daemon scanner reacquisition attempt=%d succeeded "
+                    "scanner=%s fresh_psi=true first_rtp=true",
+                    attempt,
+                    self.scanner.endpoint,
+                )
+        finally:
+            self._control_lock.release()
 
     def _refresh_psi(self) -> None:
         """Restart only the active PSI push without reopening scanner control."""
@@ -1516,4 +1704,13 @@ class DaemonRuntime:
                 self._control_reconnect_failure_streak
             ),
             process_recovery_requested=self._process_recovery_requested,
+            recovery_mode=self._recovery_mode,
+            reacquire_attempt=self._reacquire_attempt,
+            next_reacquire_seconds=(
+                None
+                if self._next_reacquire_at is None
+                else max(0.0, self._next_reacquire_at - self._clock())
+            ),
+            last_reacquire_error=self._last_reacquire_error,
+            last_reacquire_at=self._last_reacquire_at,
         )

@@ -191,6 +191,23 @@ def test_network_audio_performs_handshake_and_emits_pcmu_payload() -> None:
     assert packet.observed_at == chunks[0].received_at
 
 
+def test_network_audio_marks_first_rtp_timeout_as_failed() -> None:
+    transport = NetworkAudioTransport(
+        "192.0.2.25",
+        rtsp_client_factory=lambda *_args: FakeRtspClient(),
+        datagram_socket_factory=lambda *_args: FakeAudioDatagramSocket(),
+        local_address_resolver=lambda _host, _port: "192.0.2.10",
+    )
+    transport.start(lambda _chunk: None)
+    try:
+        with pytest.raises(ScannerConnectionError, match="first accepted"):
+            transport.wait_for_first_rtp(timeout=0.01)
+        assert transport.audio_recovery_state == "failed"
+        assert transport.running
+    finally:
+        transport.stop()
+
+
 def test_network_audio_discards_duplicate_and_out_of_order_packets() -> None:
     datagram = FakeAudioDatagramSocket()
     rtsp = FakeRtspClient()
@@ -545,9 +562,9 @@ def test_network_audio_recovers_after_keepalive_failure_without_losing_handler()
         datagrams[0].feed(make_rtp(b"before"))
         wait_until(lambda: len(chunks) == 1)
         wait_until(lambda: transport.audio_recovery_count == 1)
+        datagrams[1].feed(make_rtp(b"after"))
         wait_until(lambda: transport.audio_recovery_state == "healthy")
         datagrams[0].feed(make_rtp(b"stale"))
-        datagrams[1].feed(make_rtp(b"after"))
         wait_until(lambda: [chunk.data for chunk in chunks] == [b"before", b"after"])
         assert transport.statistics.sessions_started == 2
         assert transport.statistics.keepalive_failures == 1
@@ -601,8 +618,8 @@ def test_network_audio_recovers_after_bounded_rtp_inactivity() -> None:
         datagrams[0].feed(make_rtp(b"before"))
         wait_until(lambda: len(chunks) == 1)
         wait_until(lambda: transport.audio_recovery_count == 1, timeout=2.0)
-        wait_until(lambda: transport.audio_recovery_state == "healthy")
         datagrams[1].feed(make_rtp(b"after"))
+        wait_until(lambda: transport.audio_recovery_state == "healthy")
         wait_until(lambda: len(chunks) == 2)
         assert transport.statistics.sessions_started == 2
         assert transport.rtp_active

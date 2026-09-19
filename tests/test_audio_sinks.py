@@ -1715,3 +1715,27 @@ def test_pcm_wav_thread_start_cleanup_failure_persists_redacted_outcome(
     assert "secret recorder close detail" not in str(first.value)
     assert str(second.value) == str(first.value)
     assert recorder.close_calls == 1
+def test_audio_fanout_restarts_transport_without_duplicate_sink() -> None:
+    transport = FakeAudioTransport()
+    sink = CollectingSink("pcmu")
+    session = AudioFanoutSession(AudioStream(transport), (sink,))
+
+    session.start()
+    try:
+        transport.feed(AudioChunk(b"\xff"))
+        assert _wait_until(lambda: len(sink.received) == 1)
+        initial = session.snapshot()
+        dispatcher_ids = tuple(id(dispatcher) for dispatcher in session._dispatchers)
+
+        session.stop_stream()
+        session.start_stream()
+        transport.feed(AudioChunk(b"\xff"))
+
+        assert _wait_until(lambda: len(sink.received) == 2)
+        restarted = session.snapshot()
+        assert tuple(id(dispatcher) for dispatcher in session._dispatchers) == dispatcher_ids
+        assert len(restarted.sinks) == 1
+        assert restarted.sinks[0][0] == initial.sinks[0][0] == "pcmu"
+        assert sink.received == [struct.pack("<h", 0), struct.pack("<h", 0)]
+    finally:
+        session.stop()

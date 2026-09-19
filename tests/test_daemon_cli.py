@@ -410,6 +410,7 @@ def test_daemon_cli_constructs_one_runtime_and_process(
                 "local_port": 40000,
                 "rtsp_timeout": 6.0,
                 "keepalive_interval": 20.0,
+                "first_rtp_timeout": 5.0,
             },
         )
     ]
