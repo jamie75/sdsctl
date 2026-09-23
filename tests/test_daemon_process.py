@@ -12,6 +12,8 @@ from sds200.daemon_process import (
 )
 from sds200.exceptions import RecoveryExhaustedError
 
+from .fakes import FakeAudioTransport
+
 
 class FakeRuntime:
     def __init__(
@@ -596,6 +598,97 @@ def test_process_runs_until_requested_and_stops_before_restoring_signals() -> No
     assert runtime.start_calls == 1
     assert runtime.poll_calls == 1
     assert runtime.stop_calls == 1
+
+
+def test_process_keeps_event_and_pcmu_listeners_during_cold_start_wait() -> None:
+    from sds200.audio import AudioStream
+    from sds200.audio_sinks import AudioFanoutSession, PcmSinkRouter
+    from sds200.daemon_runtime import DaemonRuntime
+    from sds200.exceptions import CommandTimeoutError
+    from sds200.state import RadioStateSnapshot
+
+    order: list[str] = []
+
+    class RadioState:
+        @property
+        def snapshot(self) -> RadioStateSnapshot:
+            return RadioStateSnapshot(system="Test")
+
+    class Scanner:
+        endpoint = "fake://scanner"
+
+        def __init__(self) -> None:
+            self.connected = False
+            self.psi_active = False
+            self.state = RadioState()
+            self.callbacks = []
+            self.psi_attempts = 0
+
+        def on_psi(self, callback):
+            self.callbacks.append(callback)
+
+            def unsubscribe() -> None:
+                self.callbacks.remove(callback)
+
+            return unsubscribe
+
+        def connect(self) -> None:
+            self.connected = True
+
+        def get_model(self, *, timeout: float = 2.0) -> str:
+            return "SDS200"
+
+        def get_firmware(self, *, timeout: float = 2.0) -> str:
+            return "test"
+
+        def start_scanner_info_push(
+            self,
+            interval_ms: int = 500,
+            *,
+            timeout: float = 3.0,
+        ) -> object:
+            self.psi_attempts += 1
+            if self.psi_attempts == 1:
+                raise CommandTimeoutError("scanner booting")
+            self.psi_active = True
+            for callback in tuple(self.callbacks):
+                callback(object())
+            return object()
+
+        def stop_scanner_info_push(self) -> None:
+            self.psi_active = False
+
+        def close(self) -> None:
+            self.connected = False
+            self.psi_active = False
+
+    scanner = Scanner()
+    router = PcmSinkRouter()
+    audio = AudioFanoutSession(AudioStream(FakeAudioTransport()), (router,))
+    runtime = DaemonRuntime(scanner, audio, router)
+    events = FakeEventServer(order)
+    pcmu = FakePcmuServer(order)
+    api = FakeApiServer(order)
+    signals = FakeSignalController(order, (False, True))
+
+    DaemonProcess(
+        runtime,
+        api_server=api,
+        event_server=events,
+        pcmu_server=pcmu,
+        signals=signals,
+        poll_interval=0.25,
+    ).run()
+
+    assert runtime.snapshot().recovery_mode == "backoff"
+    assert events.start_calls == 1
+    assert pcmu.start_calls == 1
+    assert api.start_calls == 1
+    assert order.index("events.start") < order.index("api.start")
+    assert order.index("pcmu.start") < order.index("api.start")
+    assert order.index("api.start") < order.index("events.stop")
+    assert events.stop_calls == 1
+    assert pcmu.stop_calls == 1
 
 
 def test_process_stops_after_startup_failure() -> None:

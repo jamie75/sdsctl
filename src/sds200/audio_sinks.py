@@ -642,7 +642,7 @@ class AudioFanoutSession:
             last_audio_recovery_error=last_audio_recovery_error,
         )
 
-    def start(self) -> None:
+    def start(self, *, start_stream: bool = True) -> None:
         caught: BaseException | None = None
         with self._lifecycle_lock:
             with self._state_lock:
@@ -677,7 +677,8 @@ class AudioFanoutSession:
                 with self._state_lock:
                     self._dispatchers = tuple(dispatchers)
                 unsubscribe = self.stream.on_chunk(self._receive_chunk)
-                self.stream.start()
+                if start_stream:
+                    self.stream.start()
             except BaseException as error:
                 if unsubscribe is not None:
                     unsubscribe()

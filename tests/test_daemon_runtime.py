@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import threading
@@ -25,7 +26,9 @@ from sds200.exceptions import (
     CommandRejectedError,
     CommandTimeoutError,
     DaemonControlBusyError,
+    ScannerConnectionError,
 )
+from sds200.rtsp import RtspStartupError, RtspStatusError
 from sds200.state import RadioStateSnapshot
 from sds200.waterfall_session import WaterfallSessionState
 
@@ -337,23 +340,300 @@ def make_runtime(
     return runtime, scanner, transport, router, order
 
 
-def test_runtime_psi_timeout_remains_strict_by_default() -> None:
+def test_cold_start_control_unavailable_recovers_in_same_runtime() -> None:
+    now = [50.0]
     order: list[str] = []
-    scanner = FakeScanner(order, psi_start_failures=1)
+
+    class ScannerUnavailableAtBoot(FakeScanner):
+        available = False
+
+        def connect(self) -> None:
+            if not self.available:
+                self.order.append("scanner.connect")
+                raise ScannerConnectionError(
+                    "scanner route is not ready"
+                ) from OSError(errno.ENETUNREACH, "network unavailable")
+            super().connect()
+
+    scanner = ScannerUnavailableAtBoot(order)
+    transport = ReacquisitionAudioTransport(order)
+    transport.first_rtp_available = True
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        clock=lambda: now[0],
+        reacquire_initial_delay=1.0,
+    )
+
+    runtime.start()
+    waiting = runtime.snapshot()
+    assert waiting.state is DaemonRuntimeState.RUNNING
+    assert waiting.recovery_mode == "backoff"
+    assert waiting.reacquire_attempt == 0
+    assert waiting.next_reacquire_seconds == pytest.approx(1.0)
+    assert waiting.last_reacquire_error == "ScannerConnectionError"
+    assert not waiting.scanner_connected
+    assert waiting.router.running
+    assert not waiting.audio.running
+
+    scanner.available = True
+    now[0] = 51.1
+    runtime.poll()
+    recovered = runtime.snapshot()
+    assert recovered.state is DaemonRuntimeState.RUNNING
+    assert recovered.recovery_mode == "healthy"
+    assert recovered.scanner_connected
+    assert recovered.psi_active
+    assert recovered.audio.running
+    assert recovered.reacquire_attempt == 0
+
+    runtime.stop()
+
+
+def test_cold_start_rtsp_failure_retries_without_recreating_audio_fanout() -> None:
+    now = [10.0]
+    order: list[str] = []
+
+    class ScannerUnavailableAudio(TrackingAudioTransport):
+        unavailable = True
+
+        def start(self, handler: AudioChunkHandler) -> None:
+            if self.unavailable:
+                self.order.append("audio.start")
+                rtsp_timeout = TimeoutError("scanner not ready")
+                rtsp_error = RtspStartupError(
+                    endpoint="rtsp://fake/scanner",
+                    stage="connect",
+                    session_established=False,
+                    cause=rtsp_timeout,
+                )
+                rtsp_error.__cause__ = rtsp_timeout
+                raise ScannerConnectionError(
+                    "scanner audio endpoint is unavailable"
+                ) from rtsp_error
+            super().start(handler)
+
+    scanner = FakeScanner(order)
+    transport = ScannerUnavailableAudio(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        clock=lambda: now[0],
+        reacquire_initial_delay=1.0,
+        audio_startup_timeout=0.1,
+    )
+
+    runtime.start()
+    waiting = runtime.snapshot()
+    assert waiting.recovery_mode == "backoff"
+    assert waiting.last_reacquire_error == "ScannerConnectionError"
+    assert waiting.router.running
+    assert not waiting.audio.running
+
+    transport.unavailable = False
+    transport.first_rtp_available = True
+    now[0] = 11.1
+    runtime.poll()
+    recovered = runtime.snapshot()
+    assert recovered.recovery_mode == "healthy"
+    assert recovered.scanner_connected
+    assert recovered.psi_active
+    assert recovered.audio.running
+    assert order.count("router.start") == 1
+    assert order.count("router.stop") == 0
+
+    runtime.stop()
+
+
+@pytest.mark.parametrize("allow_degraded_psi_startup", [False, True])
+def test_cold_start_psi_rejection_is_fatal(
+    allow_degraded_psi_startup: bool,
+) -> None:
+    order: list[str] = []
+    scanner = FakeScanner(
+        order,
+        psi_start_failures=1,
+        psi_start_failure="rejected",
+    )
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        allow_degraded_psi_startup=allow_degraded_psi_startup,
+    )
+
+    with pytest.raises(CommandRejectedError):
+        runtime.start()
+
+    failed = runtime.snapshot()
+    assert failed.state is DaemonRuntimeState.FAILED
+    assert failed.recovery_mode == "healthy"
+    assert failed.next_reacquire_seconds is None
+    assert failed.last_error == "CommandRejectedError"
+    assert scanner.close_calls == 1
+    # PSI rejection happens before audio fanout/router startup.
+    assert "router.start" not in order
+    assert not router.running
+    assert router.stop_calls == 0
+    assert not transport.running
+    assert transport.stop_calls == 0
+
+    runtime.stop()
+
+
+def test_cold_start_rtsp_status_failure_is_fatal() -> None:
+    order: list[str] = []
+
+    class RejectedAudioTransport(TrackingAudioTransport):
+        def start(self, handler: AudioChunkHandler) -> None:
+            status_error = RtspStatusError("OPTIONS", 454, "Session Not Found")
+            startup_error = RtspStartupError(
+                endpoint="rtsp://fake/scanner",
+                stage="OPTIONS",
+                session_established=False,
+                cause=status_error,
+            )
+            startup_error.__cause__ = status_error
+            raise ScannerConnectionError("RTSP request rejected") from startup_error
+
+    scanner = FakeScanner(order)
+    transport = RejectedAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(scanner, audio, router)
+
+    with pytest.raises(ScannerConnectionError, match="RTSP request rejected"):
+        runtime.start()
+
+    failed = runtime.snapshot()
+    assert failed.state is DaemonRuntimeState.FAILED
+    assert failed.recovery_mode == "healthy"
+    assert failed.next_reacquire_seconds is None
+    assert failed.last_error == "ScannerConnectionError"
+    assert scanner.close_calls == 1
+    assert not router.running
+    assert router.stop_calls == 1
+
+    runtime.stop()
+
+
+def test_cold_start_absence_keeps_capped_reacquisition_running() -> None:
+    now = [0.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, psi_start_failures=20)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(scanner, audio, router, clock=lambda: now[0])
+
+    runtime.start()
+    delays: list[float] = []
+    for _ in range(8):
+        delay = runtime.snapshot().next_reacquire_seconds
+        assert delay is not None
+        delays.append(delay)
+        now[0] += delay + 0.1
+        runtime.poll()
+        waiting = runtime.snapshot()
+        assert waiting.state is DaemonRuntimeState.RUNNING
+        assert waiting.recovery_mode == "backoff"
+        assert not waiting.psi_active
+        assert waiting.router.running
+
+    assert delays == pytest.approx([10.0, 20.0, 40.0, 60.0, 60.0, 60.0, 60.0, 60.0])
+    assert runtime.snapshot().reacquire_attempt == 8
+
+    scanner.psi_start_failures = 0
+    delay = runtime.snapshot().next_reacquire_seconds
+    assert delay == pytest.approx(60.0)
+    now[0] += delay + 0.1
+    runtime.poll()
+    recovered = runtime.snapshot()
+    assert recovered.state is DaemonRuntimeState.RUNNING
+    assert recovered.recovery_mode == "healthy"
+    assert recovered.psi_active
+    assert recovered.audio.running
+
+    runtime.stop()
+
+
+def test_cold_start_local_socket_failure_remains_fatal() -> None:
+    order: list[str] = []
+
+    class LocalSocketFailureScanner(FakeScanner):
+        def connect(self) -> None:
+            self.order.append("scanner.connect")
+            raise OSError(errno.EADDRINUSE, "local socket unavailable")
+
+    scanner = LocalSocketFailureScanner(order)
     transport = TrackingAudioTransport(order)
     router = TrackingRouter(order)
     audio = AudioFanoutSession(AudioStream(transport), (router,))
     runtime = DaemonRuntime(scanner, audio, router)
 
-    with pytest.raises(CommandTimeoutError, match="secret"):
+    with pytest.raises(OSError):
         runtime.start()
 
     snapshot = runtime.snapshot()
     assert snapshot.state is DaemonRuntimeState.FAILED
+    assert snapshot.recovery_mode == "healthy"
+    assert snapshot.last_error == "OSError"
+    assert not snapshot.router.running
+    runtime.stop()
+
+
+def test_runtime_cold_start_psi_timeout_enters_existing_reacquisition() -> None:
+    now = [100.0]
+    order: list[str] = []
+    scanner = FakeScanner(order, psi_start_failures=1)
+    transport = TrackingAudioTransport(order)
+    router = TrackingRouter(order)
+    audio = AudioFanoutSession(AudioStream(transport), (router,))
+    runtime = DaemonRuntime(
+        scanner,
+        audio,
+        router,
+        clock=lambda: now[0],
+        reacquire_initial_delay=1.0,
+    )
+    transitions: list[DaemonRuntimeTransition] = []
+    runtime.on_transition(transitions.append)
+
+    runtime.start()
+
+    snapshot = runtime.snapshot()
+    assert snapshot.state is DaemonRuntimeState.RUNNING
+    assert snapshot.recovery_mode == "backoff"
+    assert snapshot.last_reacquire_error == "CommandTimeoutError"
+    assert snapshot.next_reacquire_seconds == pytest.approx(1.0)
     assert not snapshot.scanner_connected
     assert not snapshot.psi_active
+    assert snapshot.router.running
+    assert not snapshot.audio.running
     assert scanner.close_calls == 1
     assert snapshot.psi_age_seconds is None
+    assert [item.state for item in transitions] == [
+        DaemonRuntimeState.STARTING,
+        DaemonRuntimeState.RUNNING,
+    ]
+
+    now[0] = 101.1
+    runtime.poll()
+    recovered = runtime.snapshot()
+    assert recovered.state is DaemonRuntimeState.RUNNING
+    assert recovered.recovery_mode == "healthy"
+    assert recovered.scanner_connected
+    assert recovered.psi_active
+    assert recovered.audio.running
 
     runtime.stop()
 
@@ -926,17 +1206,14 @@ def test_runtime_non_timeout_inactive_psi_failure_does_not_advance_streak() -> N
     runtime.stop()
 
 
-@pytest.mark.parametrize("failure", ["timeout", "rejected"])
-def test_runtime_allows_degraded_psi_startup_and_recovers(
-    failure: Literal["timeout", "rejected"],
-) -> None:
+def test_runtime_allows_degraded_psi_timeout_startup_and_recovers() -> None:
     now = [100.0]
     order: list[str] = []
     scanner = FakeScanner(
         order,
         supports_bounded_reconnect=False,
         psi_start_failures=2,
-        psi_start_failure=failure,
+        psi_start_failure="timeout",
     )
     transport = TrackingAudioTransport(order)
     router = TrackingRouter(order)

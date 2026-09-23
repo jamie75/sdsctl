@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import logging
 import threading
 from collections import deque
@@ -24,9 +25,11 @@ from .exceptions import (
     CommandTimeoutError,
     DaemonControlBusyError,
     DaemonControlUnavailableError,
+    ScannerConnectionError,
     UnsupportedScannerFeatureError,
 )
 from .models import ScannerInfo
+from .rtsp import RtspStartupError
 from .state import RadioStateSnapshot
 from .waterfall_session import WaterfallSessionState
 
@@ -1331,39 +1334,10 @@ class DaemonRuntime:
             audio_attempted = False
 
             try:
-                scanner_attempted = True
-                self.scanner.connect()
-                self._probe_scanner_identity()
-                self._psi_unsubscribe = self.scanner.on_psi(
-                    self._observe_psi
-                )
-
-                psi_attempted = True
-                try:
-                    self.scanner.start_scanner_info_push(
-                        self.psi_interval_ms,
-                        timeout=self.psi_timeout,
-                    )
-                except (
-                    CommandRejectedError,
-                    CommandTimeoutError,
-                ) as error:
-                    if not self.allow_degraded_psi_startup:
-                        raise
-                    with self._state_lock:
-                        self._last_psi_recovery_at = self._clock()
-                    logger.warning(
-                        "daemon PSI startup deferred scanner=%s error=%s",
-                        self.scanner.endpoint,
-                        error.__class__.__name__,
-                    )
-                else:
-                    with self._state_lock:
-                        self._last_psi_at = self._clock()
-                        self._psi_ever_established = True
-
                 audio_attempted = True
-                self.audio.start()
+                scanner_attempted = True
+                psi_attempted = True
+                self._start_scanner_with_recovery()
             except BaseException as error:
                 caught = error
                 cleanup_failures: list[BaseException] = []
@@ -1424,6 +1398,126 @@ class DaemonRuntime:
             self.audio.lifecycle_snapshot().endpoint,
             self.psi_interval_ms,
         )
+
+    def _start_scanner_with_recovery(self) -> None:
+        stage = "scanner-control"
+        audio_fanout_started = False
+        try:
+            self._psi_unsubscribe = self.scanner.on_psi(self._observe_psi)
+            self.scanner.connect()
+            self._probe_scanner_identity()
+
+            stage = "psi"
+            try:
+                self.scanner.start_scanner_info_push(
+                    self.psi_interval_ms,
+                    timeout=self.psi_timeout,
+                )
+            except CommandTimeoutError as error:
+                if not self.allow_degraded_psi_startup:
+                    raise
+                with self._state_lock:
+                    self._last_psi_recovery_at = self._clock()
+                logger.warning(
+                    "daemon PSI startup deferred scanner=%s error=%s",
+                    self.scanner.endpoint,
+                    error.__class__.__name__,
+                )
+            else:
+                with self._state_lock:
+                    self._last_psi_at = self._clock()
+                    self._psi_ever_established = True
+
+            self.audio.start(start_stream=False)
+            audio_fanout_started = True
+            stage = "audio-transport"
+            self.audio.start_stream()
+        except BaseException as error:
+            if not self._is_recoverable_startup_failure(error, stage):
+                raise
+            if not audio_fanout_started:
+                self.audio.start(start_stream=False)
+
+            cleanup_failures: list[BaseException] = []
+            if self.scanner.psi_active:
+                self._cleanup_step(
+                    "PSI stream",
+                    self.scanner.stop_scanner_info_push,
+                    cleanup_failures,
+                )
+            self._cleanup_step(
+                "scanner control",
+                self.scanner.close,
+                cleanup_failures,
+            )
+            self._cleanup_step(
+                "audio transport",
+                self.audio.stop_stream,
+                cleanup_failures,
+            )
+            self._enter_reacquisition(
+                "scanner unavailable during startup",
+                error,
+            )
+            if cleanup_failures:
+                logger.warning(
+                    "daemon cold-start cleanup errors count=%d first=%s",
+                    len(cleanup_failures),
+                    cleanup_failures[0].__class__.__name__,
+                )
+            logger.warning(
+                "daemon startup deferred scanner=%s stage=%s error=%s",
+                self.scanner.endpoint,
+                stage,
+                error.__class__.__name__,
+            )
+
+    @staticmethod
+    def _is_recoverable_startup_failure(
+        error: BaseException,
+        stage: str,
+    ) -> bool:
+        """Keep expected scanner I/O failures inside the daemon lifecycle."""
+
+        if not isinstance(error, Exception):
+            return False
+        if stage == "psi" and isinstance(error, CommandTimeoutError):
+            return True
+
+        causes: list[BaseException] = []
+        cause = error.__cause__
+        while cause is not None and cause not in causes:
+            causes.append(cause)
+            cause = cause.__cause__
+
+        if isinstance(error, ScannerConnectionError):
+            network_errnos = {
+                errno.ECONNREFUSED,
+                errno.ECONNRESET,
+                errno.EHOSTDOWN,
+                errno.EHOSTUNREACH,
+                errno.ENETDOWN,
+                errno.ENETUNREACH,
+                errno.ETIMEDOUT,
+                errno.EPIPE,
+            }
+            if stage == "audio-transport":
+                for item in causes:
+                    if not isinstance(item, RtspStartupError):
+                        continue
+                    rtsp_cause = item.__cause__
+                    if isinstance(rtsp_cause, (TimeoutError, ScannerConnectionError)):
+                        return True
+                    if (
+                        isinstance(rtsp_cause, OSError)
+                        and rtsp_cause.errno in network_errnos
+                    ):
+                        return True
+            return any(
+                isinstance(item, OSError) and item.errno in network_errnos
+                for item in causes
+            )
+        return False
 
     def _probe_scanner_identity(self) -> None:
         model = self._probe_scanner_identity_value(
