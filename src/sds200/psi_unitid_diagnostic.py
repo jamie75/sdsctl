@@ -144,8 +144,9 @@ class PsiUnitIdDiagnostic:
         if self._thread is not None:
             self._thread.join(timeout=0.25)
 
-    def observe(self, info: ScannerInfo) -> None:
-        if not self._active:
+    def observe(self, info: object) -> None:
+        # on_psi also publishes non-XML acknowledgments such as PSI,OK.
+        if not isinstance(info, ScannerInfo) or not self._active:
             return
         self._seen += 1
         if not self._lock.acquire(blocking=False):

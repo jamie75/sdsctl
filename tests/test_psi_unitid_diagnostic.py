@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 
 from sds200.events import EventBus
+from sds200.models import Packet, ScannerInfo
+from sds200.parser import PacketParser
 from sds200.psi_unitid_diagnostic import PsiUnitIdDiagnostic, _private_file
 from sds200.xml_protocol import ScannerInfoParser
 
@@ -27,7 +29,7 @@ def psi(
     system: str = "System A",
     tgid: str = "1",
     mute: str = "Unmute",
-) -> Any:
+) -> ScannerInfo:
     return ScannerInfoParser().parse(
         "PSI",
         f'<ScannerInfo><System Name="{system}" Index="1" />'
@@ -50,6 +52,79 @@ def drain(item: PsiUnitIdDiagnostic) -> list[dict[str, Any]]:
             result.append(item._queue.get_nowait())
         except queue.Empty:
             return result
+
+
+def acknowledgment() -> Packet:
+    parser = PacketParser()
+    response = parser.parse_typed(parser.parse_packet("PSI,OK"))
+    assert isinstance(response, Packet)
+    return response
+
+
+def test_production_ack_xml_ack_late_name_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item, clock = observer(tmp_path)
+    bus = EventBus()
+    bus.subscribe("psi", item.observe)
+    bus.emit("psi", acknowledgment())
+    assert item._active and item._episode == item._seen == 0
+    bus.emit("psi", psi('<UnitID U_Id="UID:12345" />'))
+    clock.value = 0.25
+    bus.emit("psi", acknowledgment())
+    clock.value = 0.75
+    bus.emit("psi", psi())
+    assert item._active and item._error is None and item._reason != "observer_error"
+    rows = write_records(item, monkeypatch)
+    records = [row for row in rows if row["type"] == "observation"]
+    assert len(records) == 2 and item._seen == 2
+    assert [record["episode"] for record in records] == [1, 1]
+    assert [record["uid_numeric"] for record in records] == [12345, 12345]
+    assert records[0]["name_present"] is False
+    assert records[1]["name_raw"] == "Example"
+    assert records[1]["first_nonempty_name_ms"] == 750
+    assert records[1]["name_observed_later"] is True
+    assert rows[-1]["observer_error"] is None and rows[-1]["observations_written"] == 2
+
+
+@pytest.mark.parametrize("value", [None, 42, "PSI,OK", object(), acknowledgment()])
+def test_non_scanner_values_have_no_side_effects(
+    tmp_path: Path, value: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item, _ = observer(tmp_path)
+    item.observe(psi())
+    drain(item)
+    before = vars(item).copy()
+
+    def forbidden_clock() -> float:
+        pytest.fail("ignored callback consulted the diagnostic clock")
+
+    monkeypatch.setattr(item, "_clock", forbidden_clock)
+    before["_clock"] = forbidden_clock
+    item._lock.acquire()
+    item._queue.mutex.acquire()
+    try:
+        for _ in range(100):
+            item.observe(value)
+        assert vars(item) == before
+    finally:
+        item._queue.mutex.release()
+        item._lock.release()
+    assert item._queue.empty()
+
+
+def test_acks_do_not_consume_capacity_or_extend_deadline(tmp_path: Path) -> None:
+    item, clock = observer(tmp_path)
+    start = item._start
+    for _ in range(1100):
+        item.observe(acknowledgment())
+    assert item._seen == item._enqueued == item._drops == item._episode == 0
+    assert item._queue.empty() and item._active
+    clock.value = 301
+    item.observe(acknowledgment())
+    assert item._active and item._start == start
+    item.observe(psi())
+    assert not item._active and item._reason == "duration_limit"
 
 
 @pytest.mark.parametrize(
@@ -190,7 +265,12 @@ def test_callback_error_and_expiry_do_not_acquire_event_lock(
         pytest.fail("reader callback attempted blocking Event.set")
 
     monkeypatch.setattr(item._stop, "set", forbidden)
-    item.observe(object())
+    def broken_observation(info: ScannerInfo, now: float) -> None:
+        raise AttributeError("synthetic genuine observer failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(item, "_observe", broken_observation)
+        item.observe(psi())
     assert item._reason == "observer_error"
     item._active = True
     clock.value = 301
@@ -212,13 +292,20 @@ def test_oversized_record_list_is_unknown_not_absent(tmp_path: Path) -> None:
     assert record["ambiguous"] is True and record["truncated_fields"] == ["psi_records"]
 
 
-def test_observer_error_isolated_and_other_callbacks_continue(tmp_path: Path) -> None:
+def test_observer_error_isolated_and_other_callbacks_continue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     item, _ = observer(tmp_path)
     bus = EventBus()
     received = []
     bus.subscribe("psi", item.observe)
     bus.subscribe("psi", received.append)
-    bus.emit("psi", object())
+
+    def broken_observation(info: ScannerInfo, now: float) -> None:
+        raise AttributeError("synthetic genuine observer failure")
+
+    monkeypatch.setattr(item, "_observe", broken_observation)
+    bus.emit("psi", psi())
     assert len(received) == 1 and not item._active
     assert item._reason == "observer_error"
 
