@@ -106,7 +106,7 @@ from .daemon_pcmu_server import (
     DAEMON_PCMU_DEFAULT_SHUTDOWN_TIMEOUT,
     DaemonPcmuServer,
 )
-from .daemon_process import DaemonProcess
+from .daemon_process import DaemonProcess, DaemonProcessResult
 from .daemon_recording import DaemonRecordingManager
 from .daemon_recording_file_client import (
     DAEMON_RECORDING_FILE_CLIENT_DEFAULT_MAX_CONTENT_BYTES,
@@ -892,6 +892,13 @@ def build_parser(
         default=500,
         metavar="MS",
         help="PSI update interval in milliseconds (default: 500)",
+    )
+    daemon.add_argument(
+        "--psi-unitid-diagnostic",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Optional private PSI UnitID evidence JSONL (300s/1000 records/1 MiB)",
     )
     daemon.add_argument(
         "--psi-timeout",
@@ -3819,7 +3826,9 @@ def _run_daemon(
             **cast(Any, live_audio_process_options),
             **cast(Any, waterfall_process_options),
         )
-    result = process.run()
+    result = _run_with_psi_unitid_diagnostic(
+        process, runtime, args.psi_unitid_diagnostic,
+    )
     logger.info(
         "foreground daemon stopped audio_host=%s socket=%s event_socket=%s "
         "pcmu_socket=%s live_audio_socket=%s recording_file_socket=%s "
@@ -3838,6 +3847,47 @@ def _run_daemon(
         result.last_signal,
     )
     return 0
+
+
+def _run_with_psi_unitid_diagnostic(
+    process: DaemonProcess,
+    runtime: DaemonRuntime,
+    path: Path | None,
+) -> DaemonProcessResult:
+    if path is None:
+        return process.run()
+
+    from .psi_unitid_diagnostic import PsiUnitIdDiagnostic
+
+    diagnostic: PsiUnitIdDiagnostic | None = None
+    unsubscribe: Callable[[], None] | None = None
+
+    def close_diagnostic() -> None:
+        try:
+            if diagnostic is not None:
+                diagnostic.close()
+        except Exception:
+            logger.warning("PSI UnitID diagnostic cleanup failed")
+
+    try:
+        diagnostic = PsiUnitIdDiagnostic(
+            path, firmware=lambda: runtime.snapshot().scanner_firmware,
+            interval_ms=runtime.psi_interval_ms,
+        )
+        diagnostic.start()
+        unsubscribe = runtime.scanner.on_psi(diagnostic.observe)
+    except Exception:
+        logger.warning("PSI UnitID diagnostic could not be enabled; continuing without it")
+        close_diagnostic()
+    try:
+        return process.run()
+    finally:
+        try:
+            if unsubscribe is not None:
+                unsubscribe()
+        except Exception:
+            logger.warning("PSI UnitID diagnostic unsubscribe failed")
+        close_diagnostic()
 
 
 def _run_daemon_remote_preflight(args: argparse.Namespace) -> int:

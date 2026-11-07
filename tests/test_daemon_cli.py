@@ -3,6 +3,7 @@ from __future__ import annotations
 import signal
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,82 @@ from sds200.daemon_process import DaemonProcessResult
 from sds200.pcmu import PcmuPacketHandler
 from sds200.pcmu_protocol import PCMU_STREAM_HEADER_BYTES
 from sds200.profiles import ConnectionProfile
+
+
+def test_psi_diagnostic_default_has_no_subscription_or_writer() -> None:
+    args = cli.build_parser().parse_args(["daemon", "--interval", "250"])
+    assert args.psi_unitid_diagnostic is None and args.interval == 250
+    result = object()
+    process = SimpleNamespace(run=lambda: result)
+    # No scanner access at all in the disabled path.
+    assert cli._run_with_psi_unitid_diagnostic(process, object(), None) is result
+
+
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_psi_diagnostic_wiring_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raises: bool, cleanup_fails: bool,
+) -> None:
+    import sds200.psi_unitid_diagnostic as module
+    calls = []
+
+    class Observer:
+        def __init__(self, path, **kwargs):
+            calls.append((path, kwargs["interval_ms"]))
+            assert kwargs["firmware"]() == "Version 1.27.00"
+
+        def start(self):
+            calls.append("start")
+
+        def observe(self, value):
+            pass
+
+        def close(self):
+            calls.append("close")
+            if cleanup_fails:
+                raise OSError("cleanup")
+
+    def subscribe(callback):
+        calls.append("subscribe")
+        return lambda: calls.append("unsubscribe")
+
+    def run():
+        calls.append("run")
+        if raises:
+            raise RuntimeError("primary")
+        return "result"
+
+    monkeypatch.setattr(module, "PsiUnitIdDiagnostic", Observer)
+    runtime = SimpleNamespace(
+        scanner=SimpleNamespace(on_psi=subscribe), psi_interval_ms=250,
+        snapshot=lambda: SimpleNamespace(scanner_firmware="Version 1.27.00"),
+    )
+    path = tmp_path / "evidence"
+    args = cli.build_parser().parse_args(["daemon", "--psi-unitid-diagnostic", str(path)])
+    if raises:
+        with pytest.raises(RuntimeError, match="primary"):
+            cli._run_with_psi_unitid_diagnostic(
+                SimpleNamespace(run=run), runtime, args.psi_unitid_diagnostic,
+            )
+    else:
+        assert cli._run_with_psi_unitid_diagnostic(
+            SimpleNamespace(run=run), runtime, path,
+        ) == "result"
+    assert calls == [(path, 250), "start", "subscribe", "run", "unsubscribe", "close"]
+
+
+def test_psi_diagnostic_constructor_failure_does_not_stop_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sds200.psi_unitid_diagnostic as module
+
+    def broken(*args, **kwargs):
+        raise OSError("private diagnostic failure")
+
+    monkeypatch.setattr(module, "PsiUnitIdDiagnostic", broken)
+    assert cli._run_with_psi_unitid_diagnostic(
+        SimpleNamespace(run=lambda: "still running"), object(), tmp_path / "evidence",
+    ) == "still running"
 
 
 class FakeAudioTransport:
