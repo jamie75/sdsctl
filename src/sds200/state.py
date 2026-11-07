@@ -6,6 +6,7 @@ from threading import RLock
 from typing import Literal
 
 from .models import ScannerInfo
+from .ota_alias import OtaAliasValidator
 
 
 class ScannerScreenKind(StrEnum):
@@ -86,6 +87,8 @@ class RadioStateSnapshot:
     service_type: str | None = None
     talkgroup_id: str | None = None
     unit_id: str | None = None
+    ota_alias: str | None = None
+    ota_event: str | None = None
     volume: int | None = None
     squelch: int | None = None
     signal: int | None = None
@@ -152,6 +155,7 @@ class RadioState:
     def __init__(self) -> None:
         self._lock = RLock()
         self._snapshot = RadioStateSnapshot()
+        self._ota = OtaAliasValidator()
 
     @property
     def snapshot(self) -> RadioStateSnapshot:
@@ -162,6 +166,8 @@ class RadioState:
         current = snapshot_from_scanner_info(info)
         with self._lock:
             previous = self._snapshot
+            alias, event = self._ota.observe(info)
+            current = replace(current, ota_alias=alias, ota_event=event)
             changed = frozenset(
                 field.name
                 for field in fields(RadioStateSnapshot)

@@ -87,7 +87,7 @@ audio remains a separate subsystem capability.
 
 ## Shared live-state field inventory
 
-`RadioStateSnapshot` is the canonical 35-field renderer-neutral scanner state.
+`RadioStateSnapshot` is the canonical 37-field renderer-neutral scanner state.
 The daemon API, SSE payloads, and generic MQTT `state/radio` publication preserve
 the complete mapping. The following presentation legend applies only to this
 matrix:
@@ -136,6 +136,8 @@ Lovelace card remains read-only.
 | `service_type` | Mode-selected node; `P200`, `F` | R | R | R* | R | J | R* | Covered when available |
 | `talkgroup_id` | GSI/PSI; `F` | — | R | — | R | J | — | R1: Rich, TUI, and Home Assistant |
 | `unit_id` | GSI/PSI; `F` | — | R | — | R | J | — | R1: Rich, TUI, and Home Assistant |
+| `ota_alias` | Conservatively validated PSI UnitID.Name; `F`, `I` | — | — | — | — | J | — | Context: supplemental Scanner Companion alias, never numeric identity |
+| `ota_event` | Accepted association timestamp; `A`, `F` | — | — | — | — | J | — | Context: persistence deduplication, not a scanner display field |
 | `volume` | GSI/PSI; `P200`, `F` | — | R | R+C | R | J | — | R1: direct and daemon-owned UDP mutation physically accepted; Home Assistant remains |
 | `squelch` | GSI/PSI; `P200`, `F` | — | R | R+C | R | J | — | R1: direct and daemon-owned UDP mutation physically accepted; Home Assistant remains |
 | `signal` | GSI/PSI; `P200`, `F` | R | R | R | R | J | R | Covered |

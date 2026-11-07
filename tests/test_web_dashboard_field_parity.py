@@ -29,8 +29,12 @@ def test_dashboard_field_inventory_matches_shared_radio_state_contract() -> None
     targets = _field_targets(_asset("dashboard.js"))
     shared_fields = {field.name for field in fields(RadioStateSnapshot)}
 
-    assert len(shared_fields) == 35
-    assert set(targets) == shared_fields
+    assert len(shared_fields) == 37
+    # Supplemental Companion alias/persistence context travels in JSON but
+    # does not add controls or fields to the native scanner dashboard.
+    companion_metadata = {"ota_alias", "ota_event"}
+    assert companion_metadata <= shared_fields
+    assert set(targets) == shared_fields - companion_metadata
     assert len(set(targets.values())) == len(targets)
     for target in targets.values():
         assert dashboard.count(f'id="{target}"') == 1
